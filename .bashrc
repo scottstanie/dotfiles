@@ -4,6 +4,21 @@
 if [ -f /etc/bashrc ]; then
 	. /etc/bashrc
 fi
+
+# set PATH so it includes user's private bin if it exists
+if [ -d "$HOME/bin" ] ; then
+    PATH="$HOME/bin:$PATH"
+fi
+
+# set PATH so it includes user's private bin if it exists
+if [ -d "/usr/local/bin" ] ; then
+    PATH="/usr/local/bin:$PATH"
+fi
+
+if [ -d "/usr/local/sbin" ] ; then
+    PATH="/usr/local/sbin:$PATH"
+fi
+
 if [ -z "$SSH_AUTH_SOCK" ] ; then
 	eval `ssh-agent -s`
 fi
