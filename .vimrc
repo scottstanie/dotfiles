@@ -20,6 +20,7 @@ set nocompatible
 " and for plugins that are filetype specific.
 filetype off
 set runtimepath+=~/.vim/bundle/vundle
+set rtp+=~/.vim/bundle/vim-colors-solarized
 call vundle#begin()
 
 " Let Vundle manage itself
