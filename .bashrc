@@ -29,11 +29,24 @@ ssh-add ~/.ssh/fleet_rsa
 # Passwords for psql
 export PGPASSFILE='~/.pgpass'
 
+# Easier to type general opener on ubuntu
+alias xo='xdg-open'
+
+# Shrink a pdf with compression
+# usage: shrinkpdf input.pdf output.pdf
+shrinkpdf() {
+  gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/default \
+  -dNOPAUSE -dQUIET -dBATCH -dDetectDuplicateImages \
+  -dCompressFonts=true -r150 -sOutputFile=$2 $1
+}
+
+# pbcopy & pbpaste aliases
+alias pbcopy='xclip -selection clipboard'
+alias pbpaste='xclip -selection clipboard -o'
+
+
 # Profile a python script
 alias prof='python -m cProfile -s time'
-
-# Update homebrew
-alias morning='brew update && brew upgrade && brew doctor'
 
 alias subl='/usr/local/bin/sublime'
 
@@ -59,13 +72,7 @@ alias ..='cd ..'
 alias cl='clear'
 alias lm='ls -laxo | more'
 alias rm='rm -i'
-alias fl='fleetctl'
-alias fll='fleetctl list-units'
-alias flj='fleetctl journal'
-alias flm='fleetctl list-machines'
-export DOCKER_TLS_VERIFY=1
-export DOCKER_HOST=tcp://192.168.59.103:2376
-export DOCKER_CERT_PATH=~/.boot2docker/certs/boot2docker-vm
+
 
 # Docker functions
 drmall() {
@@ -75,3 +82,13 @@ drmall() {
 # DB connections
 alias trawl='psql -h localhost -p 5432 -U scott trawler'
 
+export LS_OPTIONS='--color=auto'
+eval "`dircolors`"
+alias ls='ls $LS_OPTIONS'
+
+
+# TexLive env variables
+# http://www.tug.org/texlive/doc/texlive-en/texlive-en.html#x1-310003.4.1
+export PATH=/usr/local/texlive/2017/bin/x86_64-linux:$PATH
+export MANPATH=/usr/local/texlive/2017/texmf-dist/doc/man:$MANPATH
+export INFOPATH=/usr/local/texlive/2017/texmf-dist/doc/info:$INFOPATH
