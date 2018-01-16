@@ -19,23 +19,46 @@ set nocompatible
 " contents. Use this to allow intelligent auto-indenting for each filetype,
 " and for plugins that are filetype specific.
 filetype off
-set runtimepath+=~/.vim/bundle/vundle
-set rtp+=~/.vim/bundle/vim-colors-solarized
+set rtp+=~/.vim/bundle/Vundle.vim
 call vundle#begin()
 
 " Let Vundle manage itself
 Bundle 'gmarik/vundle'
 
 " Plugins
-Plugin 'Valloric/YouCompleteMe'
 Plugin 'editorconfig/editorconfig-vim'
 Plugin 'Syntastic'
 Plugin 'scrooloose/nerdtree'
 Plugin 'tpope/vim-fugitive'
 Plugin 'jcf/vim-latex'
 Plugin 'surround.vim'
+Plugin 'Valloric/YouCompleteMe'
+" Plugin 'davidhalter/jedi-vim'
 
+" START https://github.com/google/vim-codefmt
+" Add maktaba and codefmt to the runtimepath.
+" (The latter must be installed before it can be used.)
+Plugin 'google/vim-maktaba'
+Plugin 'google/vim-codefmt'
+" Also add Glaive, which is used to configure codefmt's maktaba flags. See
+" `:help :Glaive` for usage.
+Plugin 'google/vim-glaive'
+" ...
 call vundle#end()
+" the glaive#Install() should go after the "call vundle#end()"
+call glaive#Install()
+" Optional: Enable codefmt's default mappings on the <Leader>= prefix.
+Glaive codefmt plugin[mappings]
+
+augroup autoformat_settings
+  autocmd FileType bzl AutoFormatBuffer buildifier
+  autocmd FileType c,cpp,proto,javascript AutoFormatBuffer clang-format
+  autocmd FileType html,css,json AutoFormatBuffer js-beautify
+  autocmd FileType python AutoFormatBuffer yapf
+  " Alternative: autocmd FileType python AutoFormatBuffer autopep8
+augroup END
+" END CODEFMT COPY PASTE
+
 filetype plugin indent on
 
 
@@ -55,6 +78,7 @@ let g:syntastic_check_on_open = 1
 let g:syntastic_check_on_wq = 0
 let g:syntastic_python_checkers = ['flake8']
 let g:syntastic_python_flake8_args='--ignore=E501,W191,E126,W0312'
+let g:syntastic_python_python_exec='python3.5'
 
 "let g:syntastic_quiet_messages = { "type": "style" }
 
@@ -64,6 +88,13 @@ let NERDTreeIgnore=['\.pyc$']
 
 " vim latex auto compile
 let g:Tex_DefaultTargetFormat='pdf'
+
+" while YCM is running
+" let g:jedi#completions_enabled = 0
+
+let g:ycm_server_python_interpreter = '/usr/bin/python'
+let g:ycm_confirm_extra_conf = 1
+let g:ycm_global_ycm_extra_conf = '~/.vim/bundle/YouCompleteMe/'
 "------------------------------------------------------------
 " Must have options {{{1
 "
@@ -106,6 +137,8 @@ set hlsearch
 " set nomodeline
 
 " Colorscheme
+let g:solarized_termcolors=256
+set t_Co=256
 set background=dark
 colorscheme solarized
 
@@ -162,7 +195,6 @@ set cmdheight=2
 
 " Display line numbers on the left
 set number
-" Use relative numbering instead of absolute
 set relativenumber
 
 " Quickly time out on keycodes, but never time out on mappings
