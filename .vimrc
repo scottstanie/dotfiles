@@ -31,7 +31,7 @@ Plugin 'Syntastic'
 Plugin 'scrooloose/nerdtree'
 Plugin 'tpope/vim-fugitive'
 Plugin 'jcf/vim-latex'
-Plugin 'surround.vim'
+Plugin 'Raimondi/delimitMate'
 Plugin 'Valloric/YouCompleteMe'
 " Plugin 'davidhalter/jedi-vim'
 
@@ -94,7 +94,10 @@ let g:Tex_DefaultTargetFormat='pdf'
 
 let g:ycm_server_python_interpreter = '/usr/bin/python'
 let g:ycm_confirm_extra_conf = 1
-let g:ycm_global_ycm_extra_conf = '~/.vim/bundle/YouCompleteMe/'
+" let g:ycm_global_ycm_extra_conf = '~/.vim/bundle/YouCompleteMe/'
+let g:ycm_global_ycm_extra_conf = '~/.ycm_extra_conf.py'
+
+let delimitMate_expand_cr = 1
 "------------------------------------------------------------
 " Must have options {{{1
 "
@@ -215,6 +218,7 @@ set pastetoggle=<F11>
 " set softtabstop=4
 " set expandtab
 autocmd Filetype javascript setlocal ts=2 sts=2 sw=2
+autocmd Filetype make setlocal noexpandtab
 
 " Indentation settings for using hard tabs for indent. Display tabs as
 " four characters wide.
@@ -240,4 +244,10 @@ nnoremap <Leader>s :%s/\<<C-r><C-w>\>//g<Left><Left>
 
 " Escape is now jk
 imap jk <Esc>
+
+" matching braces
+inoremap {      {}<Left>
+inoremap {<CR>  {<CR>}<Esc>O
+inoremap {{     {
+inoremap {}     {}
 "------------------------------------------------------------
