@@ -157,7 +157,6 @@ dictionaries-common
 diffstat					
 diffutils					
 dirmngr						
-discord						
 distro-info-data				
 dkms						
 dleyna-server					
@@ -2227,24 +2226,10 @@ linux-headers-4.4.0-116
 linux-headers-4.4.0-116-generic			
 linux-headers-generic				
 
-linux-image-4.2.0-34-generic			
-
-
 
 linux-image-4.4.0-109-generic			
 linux-image-4.4.0-112-generic			
 linux-image-4.4.0-116-generic			
-
-
-
-
-
-
-
-
-
-linux-image-extra-4.2.0-34-generic		
-
 
 
 linux-image-extra-4.4.0-109-generic		
@@ -2853,7 +2838,6 @@ texlive-pstricks
 texlive-pstricks-doc				
 texlive-science					
 texlive-science-doc				
-texstudio-qt4					
 thermald					
 thunderbird					
 thunderbird-gnome-support			
