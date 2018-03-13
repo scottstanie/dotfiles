@@ -522,7 +522,7 @@ telnet
 texlive-fonts-recommended
 texlive-latex-extra
 texlive-science
-texstudio-qt4
+texstudio
 thunderbird
 thunderbird-gnome-support
 thunderbird-locale-en
