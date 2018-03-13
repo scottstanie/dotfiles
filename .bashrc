@@ -54,6 +54,7 @@ alias prof='python -m cProfile -s time'
 alias subl='/usr/local/bin/sublime'
 
 alias repo='cd ~/repos'
+alias learn='cd ~/Documents/Learning'
 
 export ISCE_BUILD_ROOT="/home/scott/Documents/Learning/research"
 export ISCE_INSTALL_ROOT="/home/scott/Documents/Learning/research"
