@@ -1,0 +1,20 @@
+#!/bin/sh
+
+# Assumes this is currently added to crontab to record cron env
+# * * * * *  /usr/bin/env > /home/scott/cron-env
+
+if [ "$#" -eq 1 ]; then
+	ENVFILE=/home/scott/cron-env
+	CMD=$1
+else 
+	if [ "$#" -eq 2 ]; then
+		ENVFILE=$1
+		CMD=$2
+	else
+		echo 'Usage: $0 [env_file] "command"'
+		exit 1;
+	fi
+fi
+
+. "$ENVFILE"
+exec /usr/bin/env -i "$SHELL" -c ". $ENVFILE; $CMD"
