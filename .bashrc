@@ -112,5 +112,10 @@ export MANPATH=/usr/local/texlive/2017/texmf-dist/doc/man:$MANPATH
 export INFOPATH=/usr/local/texlive/2017/texmf-dist/doc/info:$INFOPATH
 
 note() {
-  vim +'normal Go' +'r!date' ~/Documents/Learning/$1.txt
+  NOTES_DIR=~/Documents/Learning/notes
+  if [ "$1" == "list" ]; then
+    ls $NOTES_DIR
+  else
+    vim +'normal Go' +'r!date' "$NOTES_DIR/$1.txt"
+  fi
 }
