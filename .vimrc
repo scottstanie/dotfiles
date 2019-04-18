@@ -73,16 +73,20 @@ set statusline+=%{SyntasticStatuslineFlag()}
 set statusline+=%*
 
 let g:syntastic_always_populate_loc_list = 1
-let g:syntastic_auto_loc_list = 0
+let g:syntastic_auto_loc_list = 1
+let g:syntastic_loc_list_height = 3
 let g:syntastic_check_on_open = 1
 let g:syntastic_check_on_wq = 0
 let g:syntastic_python_checkers = ['flake8']
-let g:syntastic_python_flake8_args='--ignore=E501,W191,E126,W0312'
-let g:syntastic_python_python_exec='python3.5'
+" let g:syntastic_python_flake8_args='--ignore=E501,W191,E126,W0312'
+let g:syntastic_python_flake8_config_file='~/.config/flake8'
+let g:syntastic_python_python_exec='python'
 
 "let g:syntastic_quiet_messages = { "type": "style" }
 
-autocmd VimEnter * NERDTree
+" Autostart nerd tree:
+"autocmd VimEnter * NERDTree
+"
 let g:NERDTreeShowHidden=1
 let NERDTreeIgnore=['\.pyc$']
 
@@ -92,7 +96,7 @@ let g:Tex_DefaultTargetFormat='pdf'
 " while YCM is running
 " let g:jedi#completions_enabled = 0
 
-let g:ycm_server_python_interpreter = '/usr/bin/python'
+let g:ycm_server_python_interpreter = '/usr/bin/python3'
 let g:ycm_confirm_extra_conf = 1
 " let g:ycm_global_ycm_extra_conf = '~/.vim/bundle/YouCompleteMe/'
 let g:ycm_global_ycm_extra_conf = '~/.ycm_extra_conf.py'

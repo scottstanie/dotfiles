@@ -1,3 +1,3 @@
 [flake8]
-ignore = E722  # For ycm?
-ignore = E402  # Module level import at top of file
+ignore=E722,E402,W503  # top level import, something for ycm, binary op line break
+max-line-length=100
