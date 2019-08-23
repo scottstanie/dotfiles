@@ -27,13 +27,16 @@ Bundle 'gmarik/vundle'
 
 " Plugins
 Plugin 'editorconfig/editorconfig-vim'
-Plugin 'Syntastic'
+" Plugin 'Syntastic'
+Plugin 'w0rp/ale'
 Plugin 'scrooloose/nerdtree'
-Plugin 'tpope/vim-fugitive'
 Plugin 'jcf/vim-latex'
-Plugin 'Raimondi/delimitMate'
 Plugin 'Valloric/YouCompleteMe'
-" Plugin 'davidhalter/jedi-vim'
+Plugin 'surround.vim'
+Plugin 'JuliaEditorSupport/julia-vim'
+Plugin 'fugitive.vim'
+" Future check back in if this is working
+" Plugin 'autozimu/LanguageClient-neovim'
 
 " START https://github.com/google/vim-codefmt
 " Add maktaba and codefmt to the runtimepath.
@@ -61,47 +64,60 @@ augroup END
 
 filetype plugin indent on
 
+" " julia languageserver instructions
+" " https://github.com/julia-vscode/LanguageServer.jl/wiki/Vim-and-Neovim
+" let g:default_julia_version = '1.1'
+" let g:LanguageClient_autoStart = 1
+" let g:LanguageClient_serverCommands = {
+" \   'julia': ['julia', '--startup-file=no', '--history-file=no', '-e', '
+" \       using LanguageServer;
+" \       using Pkg;
+" \       import StaticLint;
+" \       import SymbolServer;
+" \       env_path = dirname(Pkg.Types.Context().env.project_file);
+" \       debug = false;
+" \
+" \       server = LanguageServer.LanguageServerInstance(stdin, stdout, debug, env_path, "", Dict());
+" \       server.runlinter = true;
+" \       run(server);
+" \   ']
+" \ }
 
 " Enable syntax highlighting
 syntax on
 
-let g:slimv_swank_cmd ='! xterm -e sbcl --load ~/utils/start-swank.lisp &' "
-let g:slimv_leader=','
 
-set statusline+=%#warningmsg#
-set statusline+=%{SyntasticStatuslineFlag()}
-set statusline+=%*
+" " Syntastic settings
+" set statusline+=%#warningmsg#
+" set statusline+=%{SyntasticStatuslineFlag()}
+" set statusline+=%*
 
-let g:syntastic_always_populate_loc_list = 1
-let g:syntastic_auto_loc_list = 1
-let g:syntastic_loc_list_height = 3
-let g:syntastic_check_on_open = 1
-let g:syntastic_check_on_wq = 0
-let g:syntastic_python_checkers = ['flake8']
-" let g:syntastic_python_flake8_args='--ignore=E501,W191,E126,W0312'
-let g:syntastic_python_flake8_config_file='~/.config/flake8'
-let g:syntastic_python_python_exec='python'
+" let g:syntastic_always_populate_loc_list = 1
+" let g:syntastic_auto_loc_list = 0
+" let g:syntastic_check_on_open = 0
+" let g:syntastic_check_on_wq = 0
+" let g:syntastic_python_checkers = ['flake8']
+" " W503=linebreak before binary operator
+" let g:syntastic_python_flake8_args='--ignore=E501,W191,E126,W0312,W503'
+" let g:syntastic_python_pylint_post_args="--max-line-length=120"
+" let g:syntastic_python_python_exec='python3.4'
+""let g:syntastic_quiet_messages = { "type": "style" }
 
-"let g:syntastic_quiet_messages = { "type": "style" }
-
-" Autostart nerd tree:
-"autocmd VimEnter * NERDTree
-"
+" To start nerd tree by default
+" autocmd VimEnter * NERDTree
 let g:NERDTreeShowHidden=1
 let NERDTreeIgnore=['\.pyc$']
 
 " vim latex auto compile
 let g:Tex_DefaultTargetFormat='pdf'
 
-" while YCM is running
-" let g:jedi#completions_enabled = 0
 
-let g:ycm_server_python_interpreter = '/usr/bin/python3'
+" let g:ycm_server_python_interpreter = '/usr/bin/python'
+let g:ycm_server_python_interpreter = '/usr/bin/python3.4'
 let g:ycm_confirm_extra_conf = 1
 " let g:ycm_global_ycm_extra_conf = '~/.vim/bundle/YouCompleteMe/'
 let g:ycm_global_ycm_extra_conf = '~/.ycm_extra_conf.py'
 
-let delimitMate_expand_cr = 1
 "------------------------------------------------------------
 " Must have options {{{1
 "
@@ -202,7 +218,7 @@ set cmdheight=2
 
 " Display line numbers on the left
 set number
-set relativenumber
+" set relativenumber
 
 " Quickly time out on keycodes, but never time out on mappings
 set notimeout ttimeout ttimeoutlen=200
@@ -220,7 +236,7 @@ set pastetoggle=<F11>
 " Do not change 'tabstop' from its default value of 8 with this setup.
 " set shiftwidth=4
 " set softtabstop=4
-" set expandtab
+set expandtab
 autocmd Filetype javascript setlocal ts=2 sts=2 sw=2
 autocmd Filetype make setlocal noexpandtab
 
@@ -249,9 +265,4 @@ nnoremap <Leader>s :%s/\<<C-r><C-w>\>//g<Left><Left>
 " Escape is now jk
 imap jk <Esc>
 
-" matching braces
-inoremap {      {}<Left>
-inoremap {<CR>  {<CR>}<Esc>O
-inoremap {{     {
-inoremap {}     {}
 "------------------------------------------------------------
