@@ -27,13 +27,12 @@ Bundle 'gmarik/vundle'
 
 " Plugins
 Plugin 'editorconfig/editorconfig-vim'
-Plugin 'Syntastic'
+" Plugin 'Syntastic'
+Plugin 'w0rp/ale'
 Plugin 'scrooloose/nerdtree'
-Plugin 'tpope/vim-fugitive'
 Plugin 'jcf/vim-latex'
-Plugin 'Raimondi/delimitMate'
 Plugin 'Valloric/YouCompleteMe'
-" Plugin 'davidhalter/jedi-vim'
+Plugin 'surround.vim'
 
 " START https://github.com/google/vim-codefmt
 " Add maktaba and codefmt to the runtimepath.
@@ -68,21 +67,22 @@ syntax on
 let g:slimv_swank_cmd ='! xterm -e sbcl --load ~/utils/start-swank.lisp &' "
 let g:slimv_leader=','
 
-set statusline+=%#warningmsg#
-set statusline+=%{SyntasticStatuslineFlag()}
-set statusline+=%*
-
-let g:syntastic_always_populate_loc_list = 1
-let g:syntastic_auto_loc_list = 1
-let g:syntastic_loc_list_height = 3
-let g:syntastic_check_on_open = 1
-let g:syntastic_check_on_wq = 0
-let g:syntastic_python_checkers = ['flake8']
-" let g:syntastic_python_flake8_args='--ignore=E501,W191,E126,W0312'
-let g:syntastic_python_flake8_config_file='~/.config/flake8'
-let g:syntastic_python_python_exec='python'
-
-"let g:syntastic_quiet_messages = { "type": "style" }
+" Syntastic settings
+" set statusline+=%#warningmsg#
+" set statusline+=%{SyntasticStatuslineFlag()}
+" set statusline+=%*
+"
+" let g:syntastic_always_populate_loc_list = 1
+" let g:syntastic_auto_loc_list = 1
+" let g:syntastic_loc_list_height = 3
+" let g:syntastic_check_on_open = 1
+" let g:syntastic_check_on_wq = 0
+" let g:syntastic_python_checkers = ['flake8']
+" " let g:syntastic_python_flake8_args='--ignore=E501,W191,E126,W0312'
+" let g:syntastic_python_flake8_config_file='~/.config/flake8'
+" let g:syntastic_python_python_exec='python'
+"
+""let g:syntastic_quiet_messages = { "type": "style" }
 
 " Autostart nerd tree:
 "autocmd VimEnter * NERDTree
@@ -101,7 +101,6 @@ let g:ycm_confirm_extra_conf = 1
 " let g:ycm_global_ycm_extra_conf = '~/.vim/bundle/YouCompleteMe/'
 let g:ycm_global_ycm_extra_conf = '~/.ycm_extra_conf.py'
 
-let delimitMate_expand_cr = 1
 "------------------------------------------------------------
 " Must have options {{{1
 "
@@ -249,9 +248,9 @@ nnoremap <Leader>s :%s/\<<C-r><C-w>\>//g<Left><Left>
 " Escape is now jk
 imap jk <Esc>
 
-" matching braces
-inoremap {      {}<Left>
-inoremap {<CR>  {<CR>}<Esc>O
-inoremap {{     {
-inoremap {}     {}
+"" matching braces
+"inoremap {      {}<Left>
+"inoremap {<CR>  {<CR>}<Esc>O
+"inoremap {{     {
+"inoremap {}     {}
 "------------------------------------------------------------

@@ -31,7 +31,10 @@ if [ -z "$SSH_AUTH_SOCK" ] ; then
 	eval `ssh-agent -s`
 fi
 # Store 2000 commands in ~/.bash_history
-HISTSIZE=2000
+export HISTSIZE=2000
+export HISTFILESIZE=50000
+# cat ~/.bash_history >> ~/.bash_eternal_history
+sort ~/.bash_history  ~/.bash_eternal_history | uniq > ~/.tmp; mv ~/.tmp ~/.bash_eternal_history
 
 # set a fancy prompt (this overwrites /etc/bash.bashrc in ubuntu)
 PS1='${debian_chroot:+($debian_chroot)}\u:\W\$ '
@@ -52,30 +55,40 @@ alias xo='open'
 shrinkpdf() {
   gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/default \
   -dNOPAUSE -dQUIET -dBATCH -dDetectDuplicateImages \
-  -dCompressFonts=true -r150 -sOutputFile=$2 $1
+  -dCompressFonts=true -r150 -sOutputFile=$2 "$1"
 }
+
+# test for if conda has been instantiated
+alias ca='conda activate'
+# ca mapping
 
 # Profile a python script
 alias prof='python -m cProfile -s time'
 
 alias subl='/usr/local/bin/sublime'
 
-alias repo='cd ~/repos'
 alias learn='cd ~/Documents/Learning'
 
-export ISCE_BUILD_ROOT="/home/scott/Documents/Learning/research"
-export ISCE_INSTALL_ROOT="/home/scott/Documents/Learning/research"
-export LIB_LOCATION_HOME="/usr"
+export SCONS_CONFIG_DIR="/Users/scott/repos/isce2/build"
+export ISCE_BUILD_ROOT="/Users/scott/repos/isce2/build/"
+export ISCE_INSTALL_ROOT="/Users/scott/repos/isce2/install/"
+# export LIB_LOCATION_HOME="/usr"
 # The directory in which ISCE will be built
+export ISCE_HOME=$ISCE_INSTALL_ROOT/packages/isce
+export PYTHONPATH=$ISCE_INSTALL_ROOT/packages:$PYTHONPATH
+export PATH=$ISCE_HOME/applications:$PATH
 
 # Make the pip install --user location on the path
-export PATH="/Users/scott/Library/Python/3.7/bin:$PATH"
-# Virtualenvwrapper
-export VIRTUALENVWRAPPER_PYTHON=/usr/local/bin/python3
-export WORKON_HOME=~/envs
-source ~/Library/Python/3.7/bin/virtualenvwrapper.sh
+# export PATH="/Users/scott/Library/Python/3.7/bin:$PATH"
 
-alias js='jekyll serve'
+# Virtualenvwrapper
+# export VIRTUALENVWRAPPER_PYTHON=/usr/local/bin/python3
+# export VIRTUALENVWRAPPER_VIRTUALENV=/Users/scott/Library/Python/3.7/bin/virtualenv
+# export WORKON_HOME=~/envs
+# source ~/Library/Python/3.7/bin/virtualenvwrapper.sh
+# workon data
+
+alias js='bundle exec jekyll serve'
 
 
 # Git shortcuts
@@ -90,18 +103,50 @@ alias ..='cd ..'
 alias cl='clear'
 alias lsm='ls -laxo | more'
 alias lsh='ls -lh'
+alias lss='ls -lhS'
 alias lst='ls -lht'
+lsth() { lst $1 | head; }
 alias rm='rm -i'
 alias fl='fleetctl'
 alias fll='fleetctl list-units'
 alias flj='fleetctl journal'
 alias flm='fleetctl list-machines'
 
+REPODIR="${HOME}/repos"
+alias repo="cd ${REPODIR}"
+
+
+# REPOS="insar apertools sardem InsarTimeseries.jl Sario MapImages LOS sentinel_l0 sentinel sentineleof insar-los blobsar trodi troposim spurs uavsar"
+REPOS="insar apertools sardem sentinel_l0 sentinel sentineleof insar-los blobsar trodi troposim spurs uavsar PSInSAR"
+gplsar() {
+    repo
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && gpl &&cd $REPODIR
+    done
+}
+stsar() {
+    repo
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && echo $D && st && cd $REPODIR
+    done
+}
+
+gpshsar() {
+    repo
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && git push && cd $REPODIR
+    done
+}
+
 # Docker functions
 drmall() {
 	docker rmi $(docker images | grep "<none>" | awk '{print($3)}')
 }
 
+# Added https://github.com/JuliaPy/PyPlot.jl/issues/453
+export MPLBACKEND=qt5agg
+
+export JULIA_NUM_THREADS=4
 
 # Not needed on mac:
 # pbcopy & pbpaste aliases
@@ -115,9 +160,9 @@ drmall() {
 
 # TexLive env variables
 # http://www.tug.org/texlive/doc/texlive-en/texlive-en.html#x1-310003.4.1
-export PATH=/usr/local/texlive/2017/bin/x86_64-linux:$PATH
-export MANPATH=/usr/local/texlive/2017/texmf-dist/doc/man:$MANPATH
-export INFOPATH=/usr/local/texlive/2017/texmf-dist/doc/info:$INFOPATH
+export PATH=/usr/local/texlive/2021/bin/x86_64-darwin:$PATH
+export MANPATH=/usr/local/texlive/2021/texmf-dist/doc/man:$MANPATH
+export INFOPATH=/usr/local/texlive/2021/texmf-dist/doc/info:$INFOPATH
 
 note() {
   NOTES_DIR=~/Documents/Learning/notes
@@ -127,3 +172,17 @@ note() {
     vim +'normal Go' +'r!date' "$NOTES_DIR/$1.txt"
   fi
 }
+
+# heroku autocomplete setup
+HEROKU_AC_BASH_SETUP_PATH=/Users/scott/Library/Caches/heroku/autocomplete/bash_setup && test -f $HEROKU_AC_BASH_SETUP_PATH && source $HEROKU_AC_BASH_SETUP_PATH;
+
+# Add Visual Studio Code (code)
+export PATH="$PATH:/Applications/Visual Studio Code.app/Contents/Resources/app/bin"
+alias blender="/Applications/blender.app/Contents/MacOS/blender"
+
+
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+
+export BASH_SILENCE_DEPRECATION_WARNING=1
