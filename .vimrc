@@ -60,12 +60,28 @@ augroup END
 
 filetype plugin indent on
 
+" " julia languageserver instructions
+" " https://github.com/julia-vscode/LanguageServer.jl/wiki/Vim-and-Neovim
+" let g:default_julia_version = '1.1'
+" let g:LanguageClient_autoStart = 1
+" let g:LanguageClient_serverCommands = {
+" \   'julia': ['julia', '--startup-file=no', '--history-file=no', '-e', '
+" \       using LanguageServer;
+" \       using Pkg;
+" \       import StaticLint;
+" \       import SymbolServer;
+" \       env_path = dirname(Pkg.Types.Context().env.project_file);
+" \       debug = false;
+" \
+" \       server = LanguageServer.LanguageServerInstance(stdin, stdout, debug, env_path, "", Dict());
+" \       server.runlinter = true;
+" \       run(server);
+" \   ']
+" \ }
 
 " Enable syntax highlighting
 syntax on
 
-let g:slimv_swank_cmd ='! xterm -e sbcl --load ~/utils/start-swank.lisp &' "
-let g:slimv_leader=','
 
 " Syntastic settings
 " set statusline+=%#warningmsg#
@@ -93,10 +109,9 @@ let NERDTreeIgnore=['\.pyc$']
 " vim latex auto compile
 let g:Tex_DefaultTargetFormat='pdf'
 
-" while YCM is running
-" let g:jedi#completions_enabled = 0
 
-let g:ycm_server_python_interpreter = '/usr/bin/python3'
+" let g:ycm_server_python_interpreter = '/usr/bin/python'
+let g:ycm_server_python_interpreter = '/usr/bin/python3.4'
 let g:ycm_confirm_extra_conf = 1
 " let g:ycm_global_ycm_extra_conf = '~/.vim/bundle/YouCompleteMe/'
 let g:ycm_global_ycm_extra_conf = '~/.ycm_extra_conf.py'
@@ -201,7 +216,7 @@ set cmdheight=2
 
 " Display line numbers on the left
 set number
-set relativenumber
+" set relativenumber
 
 " Quickly time out on keycodes, but never time out on mappings
 set notimeout ttimeout ttimeoutlen=200
@@ -219,7 +234,7 @@ set pastetoggle=<F11>
 " Do not change 'tabstop' from its default value of 8 with this setup.
 " set shiftwidth=4
 " set softtabstop=4
-" set expandtab
+set expandtab
 autocmd Filetype javascript setlocal ts=2 sts=2 sw=2
 autocmd Filetype make setlocal noexpandtab
 
@@ -248,9 +263,4 @@ nnoremap <Leader>s :%s/\<<C-r><C-w>\>//g<Left><Left>
 " Escape is now jk
 imap jk <Esc>
 
-"" matching braces
-"inoremap {      {}<Left>
-"inoremap {<CR>  {<CR>}<Esc>O
-"inoremap {{     {
-"inoremap {}     {}
 "------------------------------------------------------------
