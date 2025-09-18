@@ -1,0 +1,205 @@
+# .bashrc
+
+export EDITOR=vim
+
+# https://superuser.com/questions/39751/add-directory-to-path-if-its-not-already-there
+pathadd() {
+    if [ -d "$1" ] && [[ ":$PATH:" != *":$1:"* ]]; then
+        # PATH="${PATH:+"$PATH:"}$1"
+        PATH="$1:${PATH}"
+    fi
+}
+
+pathadd "$HOME/bin"
+pathadd "$HOME/.local/bin"
+pathadd "/usr/local/bin"
+pathadd "/usr/local/sbin"
+
+
+# Source global definitions
+if [ -f /etc/bashrc ]; then
+    . /etc/bashrc
+fi
+
+if [ -f /etc/bash_completion ]; then
+    . /etc/bash_completion
+fi
+
+# open vim with no .vimrc
+export vi="vi -u NONE"
+
+alias ls='ls --color=auto'
+# Git shortcuts
+alias st='git status'
+alias ci='git commit'
+alias gpsh='git push'
+alias gd='git diff'
+alias gb='git branch'
+alias gpl='git pull'
+alias gk='git checkout'
+
+alias ..='cd ..'
+alias cl='clear'
+alias lsm='ls -laxo | more'
+alias lsh='ls -lh'
+alias lss='ls -lhS'
+alias lst='ls -lht'
+lsth() { lst $1 | head; }
+alias rm='rm -i'
+
+
+# Profile a python script
+alias prof='python -m cProfile -s time'
+alias pdb='python -m ipdb -c continue'
+
+REPODIR="${HOME}/repos"
+alias repo="cd ${REPODIR}"
+# NOTE: this will make terminal plots fail
+# https://stackoverflow.com/questions/2801882/generating-a-png-with-matplotlib-when-display-is-undefined?lq=1
+# BUT this really speeds up import time for some reason...
+# https://github.com/matplotlib/matplotlib/blob/6a7be8250ec2068084f5f7a009aba668253e4049/src/_c_internal_utils.c#L13
+# display_is_valid gets called and the XOpenDisplay call is very slow with DISPLAY=localhost:10.0
+# so either setting DISPLAY='' or this works
+export MPLBACKEND="agg"
+
+# https://github.com/insarlab/MintPy/blob/6fffa3b3940362c3120499f9956c9a52c7ca7fdb/docs/installation.md?plain=1#L228
+export HDF5_USE_FILE_LOCKING=FALSE
+
+# REPOS="dolphin insar apertools sardem sentineleof blobsar trodi troposim spurs uavsar COMPASS s1-reader tophu"
+REPOS="dolphin disp-s1 spurt orca snaphu-py sweets apertools COMPASS s1-reader tophu"
+gplsar() {
+    repo
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && gpl &&cd $REPODIR
+    done
+}
+stsar() {
+    repo
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && echo $D && st && cd $REPODIR
+    done
+}
+
+gpshsar() {
+    repo
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && git push && cd $REPODIR
+    done
+}
+
+gitgrephist() {
+    git grep "$1" $(git rev-list --all)
+}
+
+
+export BASH_SILENCE_DEPRECATION_WARNING=1
+
+export OMP_NUM_THREADS=24
+# export OPENBLAS_NUM_THREADS=2
+
+
+## GEOSPATIAL FUNCTIONS
+mdxunw() {
+    # mdxunw <image> <cols>
+    #  -rtlr  =  Size of trailer (in bytes) at the end of each line
+    xsize=$(gdalinfo -json $1 | jq .size[0])
+    linebytes=$(( 4 * ${xsize} ))
+    mdx "$1" -cols ${xsize} -wrap 9.42 -rhdr $linebytes -CW -unw -r4 -cmap cmy
+}
+
+xsize() {
+    gdalinfo -json $1 | jq .size[0]
+}
+
+ysize() {
+    gdalinfo -json $1 | jq .size[1]
+}
+
+shape_rio () {
+    # Merge the count,rows,cols by removing [, ], and combining newlines with ,
+    for f in $@; do
+        echo $f
+        shape3=$(DISPLAY='' rio info $f | jq -c .count,.shape | tr -d '\[\]' | paste -s -d,)
+        echo $shape3
+   done
+}
+shape ()
+{
+    for f in $@;
+    do
+        echo $f;
+        shape3=$(gdalinfo $f | grep "Size is" | cut -d' ' -f3-4 | tr ',' '\n' | tac | tr '\n' ',' | sed 's/,$//');
+        echo $shape3;
+    done
+}
+SHRINKOPTS="-co compress=deflate -co predictor=2 -co tiled=yes -co nbits=16 "
+gdalshrink()
+{
+    gdal_translate $SHRINKOPTS $1 $2
+}
+gdalshrinkall()
+{
+    for f in $@;
+    do
+        out="$f.16bit.tif"
+        echo $f $out;
+        gdalshrink "$f" "$out"
+        mv "$out" $f
+    done
+}
+average_rasters()
+{
+    # Check if at least two arguments are provided (output file + at least one input file)
+    if [ $# -lt 2 ]; then
+        echo "Usage: average_rasters output_file.tif input1.tif [input2.tif ...]"
+        return 1
+    fi
+
+    # First argument is the output file
+    outfile="$1"
+    shift  # Remove the first argument from the argument list
+
+    # The rest of the arguments are input files
+    gdal_calc --outfile "$outfile" --allBands A --calc 'numpy.nanmean(A, axis=0)' \
+      --NoDataValue 0 --type Float32 \
+      --co compress=deflate --co nbits=16 --co tiled=yes \
+      -A "$@"
+}
+
+
+h5dump_attr() {
+    if [ "$#" -ne 2 ]; then
+        echo "Usage: h5dump_attr <filename> <dataset_or_group_name>"
+        return 1
+    fi
+    local filename="$1"
+    local attr_name="$2"
+    if [ "$#" -le 3 ]; then
+        local dset="${3-''}"
+        h5dump -a "${attr_name}" "$filename"
+    else
+        h5dump -a "${dset}/${attr_name}" "$filename"
+    fi
+}
+
+
+conda-list-sizes() {
+    grep '"size":' ${CONDA_PREFIX_1}/envs/$1/conda-meta/*.json | sort -k3rn | sed 's/.*conda-meta\///g' | column -t
+}
+
+# # >>> juliaup initialize >>>
+#
+# # !! Contents within this block are managed by juliaup !!
+#
+# case ":$PATH:" in
+#     *:/home/staniewi/dev/.juliaup/bin:*)
+#         ;;
+#
+#     *)
+#         export PATH=/home/staniewi/dev/.juliaup/bin${PATH:+:${PATH}}
+#         ;;
+# esac
+#
+# # <<< juliaup initialize <<<
+#
+# export PATH="/home/staniewi/dev/bin:$PATH"
