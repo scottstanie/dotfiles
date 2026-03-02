@@ -1,0 +1,48 @@
+# zshrc_linux
+# Symlink this to ~/.zshrc:  ln -sf ~/repos/dotfiles/zshrc_linux ~/.zshrc
+source "${0:A:h}/zshrc_common"
+
+# Repos checked out on this machine
+REPOS=(dolphin sweets apertools sardem snaphu-py sentineleof disp-s1 opera-utils burst_db orca COMPASS s1-reader tophu)
+
+# ISCE2
+export ISCE_BUILD_ROOT="${REPODIR}/isce2/build/"
+export ISCE_INSTALL_ROOT="${REPODIR}/isce2/install/"
+export ISCE_HOME=$ISCE_INSTALL_ROOT/packages/isce
+export PYTHONPATH=$ISCE_INSTALL_ROOT/packages:$PYTHONPATH
+export path=($ISCE_HOME/applications $ISCE_INSTALL_ROOT/bin $path)
+
+# FRINGE
+FRINGE_DIR="${REPODIR}/fringe/install"
+export path=($path ${FRINGE_DIR}/bin)
+export PYTHONPATH=$PYTHONPATH:${FRINGE_DIR}/python
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${FRINGE_DIR}/lib
+
+# Headless display / threading
+export MPLBACKEND="agg"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=1
+
+# SAR utilities
+mdxunw() {
+    xsize=$(gdalinfo -json $1 | jq .size[0])
+    linebytes=$(( 4 * ${xsize} ))
+    mdx "$1" -cols ${xsize} -wrap 9.42 -rhdr $linebytes -CW -unw -r4 -cmap cmy
+}
+xsize() { gdalinfo -json $1 | jq .size[0] }
+ysize() { gdalinfo -json $1 | jq .size[1] }
+
+# Conda
+__conda_setup="$("$HOME/miniforge3/bin/conda" 'shell.zsh' 'hook' 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    eval "$__conda_setup"
+else
+    if [ -f "$HOME/miniforge3/etc/profile.d/conda.sh" ]; then
+        . "$HOME/miniforge3/etc/profile.d/conda.sh"
+    else
+        export PATH="$HOME/miniforge3/bin:$PATH"
+    fi
+fi
+unset __conda_setup
+[[ -f "$HOME/miniforge3/etc/profile.d/mamba.sh" ]] && . "$HOME/miniforge3/etc/profile.d/mamba.sh"
+conda activate mapping-311

@@ -1,0 +1,92 @@
+# zshrc_mac
+# Symlink this to ~/.zshrc:  ln -sf ~/repos/dotfiles/zshrc_mac ~/.zshrc
+source "${0:A:h}/zshrc_common"
+
+# Repos checked out on this machine (edit per machine)
+REPOS=(dolphin disp-s1 opera_utils sweets apertools COMPASS s1-reader tophu snaphu-py)
+
+# ISCE2 (comment out if not installed)
+export ISCE_BUILD_ROOT="${REPODIR}/isce2/build/"
+export ISCE_INSTALL_ROOT="${REPODIR}/isce2/install"
+export ISCE_HOME=$ISCE_INSTALL_ROOT/packages/isce
+export ISCE_STACK="${REPODIR}/isce2/contrib/stack"
+export PYTHONPATH=$ISCE_INSTALL_ROOT/packages:$PYTHONPATH
+export path=($path $ISCE_INSTALL_ROOT/bin $ISCE_HOME/applications)
+export DYLD_LIBRARY_PATH=$DYLD_LIBRARY_PATH:${ISCE_INSTALL_ROOT}/packages/isce2
+
+# TexLive
+export path=(/usr/local/texlive/2021/bin/x86_64-darwin $path)
+export MANPATH=/usr/local/texlive/2021/texmf-dist/doc/man:$MANPATH
+export INFOPATH=/usr/local/texlive/2021/texmf-dist/doc/info:$INFOPATH
+
+# VS Code
+export path=($path "/Applications/Visual Studio Code.app/Contents/Resources/app/bin")
+
+# Homebrew
+eval "$(/opt/homebrew/bin/brew shellenv)"
+export path=("/opt/homebrew/opt/ruby/bin" $path)
+
+# Utilities
+function reload_vpn() {
+    sudo launchctl unload -w /Library/LaunchDaemons/net.pulsesecure.AccessService.plist
+    sudo launchctl load -w /Library/LaunchDaemons/net.pulsesecure.AccessService.plist
+}
+nisar2nc() {
+    for src in "$@"; do
+        [[ -f "$src" && "${src##*.}" == "h5" ]] || { echo "skipping $src"; continue }
+        dest="${src%.h5}.nc"
+        ln -s "$src" "$dest"
+        echo "-> $dest"
+    done
+}
+function demheight() {
+    lon=$1
+    lat=$2
+    VRT="/vsicurl/https://raw.githubusercontent.com/scottstanie/sardem/master/sardem/data/cop_global.vrt"
+    gdallocationinfo -wgs84 -valonly "$VRT" "$lon" "$lat"
+}
+
+# Capella (ignored if key file missing)
+alias cr='capella-reader'
+[[ -f ~/.console-api-key ]] && export CAPELLA_API_KEY=$(cat ~/.console-api-key)
+
+# NVM
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
+
+# Juliaup
+case ":$PATH:" in
+    *:$HOME/.juliaup/bin:*) ;;
+    *) export path=($HOME/.juliaup/bin $path) ;;
+esac
+
+# Extra tool PATHs (each guarded so missing ones are harmless)
+[[ -d "$HOME/.codeium/windsurf/bin" ]] && export PATH="$HOME/.codeium/windsurf/bin:$PATH"
+[[ -d "$HOME/.lmstudio/bin" ]] && export PATH="$HOME/.lmstudio/bin:$PATH"
+[[ -d "$HOME/.modular/bin" ]] && export PATH="$HOME/.modular/bin:$PATH"
+alias claude-yolo='claude --dangerously-skip-permissions'
+
+# --- Package management: conda or pixi (auto-detected) ---
+if [[ -d "$HOME/.pixi" ]]; then
+    export PATH="$HOME/.pixi/bin:$PATH"
+    function pixi-shell() {
+        local curdir="$(pwd)"
+        cd ~/repos/pixi-envs/$1
+        pixi shell
+        cd "$curdir"
+    }
+    alias pixi-map="pixi-shell mapping-313"
+fi
+if [[ -f "$HOME/miniforge3/bin/conda" ]]; then
+    __conda_setup="$("$HOME/miniforge3/bin/conda" 'shell.zsh' 'hook' 2> /dev/null)"
+    if [ $? -eq 0 ]; then
+        eval "$__conda_setup"
+    else
+        if [ -f "$HOME/miniforge3/etc/profile.d/conda.sh" ]; then
+            . "$HOME/miniforge3/etc/profile.d/conda.sh"
+        else
+            export PATH="$HOME/miniforge3/bin:$PATH"
+        fi
+    fi
+    unset __conda_setup
+fi

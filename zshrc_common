@@ -1,0 +1,163 @@
+# zshrc_common - shared zsh configuration
+# Source this from your per-machine zshrc (which is symlinked to ~/.zshrc)
+
+# Zsh init
+autoload -Uz compinit
+compinit
+
+if [ -f /etc/zshrc ]; then
+    . /etc/zshrc
+fi
+
+# Path additions
+path=(
+    "$HOME/.local/bin"
+    "$HOME/bin"
+    "/usr/local/bin"
+    "/usr/local/sbin"
+    $path
+)
+typeset -U path
+
+# SSH agent setup
+if [ -z "$SSH_AUTH_SOCK" ]; then
+    eval "$(ssh-agent -s)"
+fi
+[[ -f ~/.ssh/id_ed25519 ]] && ssh-add ~/.ssh/id_ed25519
+
+# History
+HISTSIZE=2000
+SAVEHIST=50000
+HISTFILE=~/.zsh_history
+setopt APPEND_HISTORY
+setopt EXTENDED_HISTORY
+setopt HIST_IGNORE_ALL_DUPS
+
+# Spaceship prompt — installed via brew (macOS) or git clone (Linux)
+# Falls back to a simple prompt if not found
+if [[ -f /opt/homebrew/opt/spaceship/spaceship.zsh ]]; then
+    source /opt/homebrew/opt/spaceship/spaceship.zsh
+elif [[ -f "${HOMEBREW_PREFIX}/opt/spaceship/spaceship.zsh" ]]; then
+    source "${HOMEBREW_PREFIX}/opt/spaceship/spaceship.zsh"
+elif [[ -f "$HOME/.zsh/spaceship/spaceship.zsh" ]]; then
+    source "$HOME/.zsh/spaceship/spaceship.zsh"
+else
+    PS1='%n:%1~$ '
+fi
+
+# Editor
+export EDITOR=vim
+alias vi='vi -u NONE'
+
+# General aliases
+alias ..='cd ..'
+alias cl='clear'
+alias lsm='ls -laxo | more'
+alias lsh='ls -lh'
+alias lss='ls -lhS'
+alias lst='ls -lht'
+function lsth() { lst $1 | head }
+alias rm='rm -i'
+
+# Git aliases
+alias st='git status'
+alias ci='git commit'
+alias gpsh='git push'
+alias ga='git add'
+alias gd='git diff'
+alias gb='git branch'
+alias gpl='git pull'
+alias gk='git checkout'
+alias gw='git worktree'
+alias gwd='git diff --color-words'
+
+# Python
+alias prof='python -m cProfile -s time'
+alias pdb='python -m ipdb -c continue'
+alias ca='conda activate'
+
+# Directories
+REPODIR="${HOME}/repos"
+alias repo="cd ${REPODIR}"
+alias learn='cd ~/Documents/Learning'
+
+# ISCE2 stack processor helpers (work on any machine with isce2 checked out)
+function isce_add_strip() {
+    export path=($path ${REPODIR}/isce2/contrib/stack/stripmapStack/)
+}
+function isce_add_tops() {
+    export path=($path ${REPODIR}/isce2/contrib/stack/topsStack/)
+}
+
+# Repository management — set REPOS=(...) in per-machine file
+function gplsar() {
+    cd $REPODIR
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && gpl && cd $REPODIR
+    done
+}
+function stsar() {
+    cd $REPODIR
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && echo $D && st && cd $REPODIR
+    done
+}
+function gpshsar() {
+    cd $REPODIR
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && git push && cd $REPODIR
+    done
+}
+function pipsar() {
+    cd $REPODIR
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && pip install --no-deps -e . && cd $REPODIR
+    done
+}
+function lsimports() {
+    git grep import | cut -d':' -f 2 | sed -e 's/[[:space:]]*$//' | sed -e 's/^[[:space:]]*//' | sort | uniq
+}
+function gitgrephist() {
+    git grep "$1" $(git rev-list --all)
+}
+
+# PDF compression
+shrinkpdf() {
+    gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/default \
+    -dNOPAUSE -dQUIET -dBATCH -dDetectDuplicateImages \
+    -dCompressFonts=true -r150 -sOutputFile="$2" "$1"
+}
+
+# GIS / raster utilities
+function shape() {
+    for f in $@; do
+        echo $f
+        shape3=$(DISPLAY='' rio info $f | jq -c .count,.shape | tr -d '\[\]')
+        echo $shape3
+    done
+}
+function save_phase() {
+    gdal_calc.py -A $1 --outfile $2 --type Float32 --calc "angle(A)"
+    gdal_translate $2 tmptif.tif -of COG -co "RESAMPLING=NEAREST"
+    mv tmptif.tif $2
+}
+function mov2gif() {
+    output="${2:-screen.gif}"
+    ffmpeg -i $1 -vf "fps=10,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" -loop 0 $output
+}
+function compresstif() {
+    gdal_translate $1 /tmp/tmptif.tif -co compress=deflate -co predictor=2 -co tiled=yes && mv /tmp/tmptif.tif $1
+}
+export SHRINKOPTS=" -co nbits=16 -co compress=deflate -co predictor=2 -co tiled=yes "
+
+# Environment
+export HDF5_USE_FILE_LOCKING=FALSE
+export CLICOLOR=1
+export LSCOLORS=GxFxCxDxBxegedabagaced
+
+# Optional tools — sourced only if installed
+[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+[[ -f "$HOME/.asdf/asdf.sh" ]] && source "$HOME/.asdf/asdf.sh"
+
+# Jekyll
+alias js='bundle exec jekyll serve'
