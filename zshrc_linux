@@ -1,6 +1,6 @@
 # zshrc_linux
 # Symlink this to ~/.zshrc:  ln -sf ~/repos/dotfiles/zshrc_linux ~/.zshrc
-source "${0:A:h}/zshrc_common"
+source "${${:-$HOME/.zshrc}:A:h}/zshrc_common"
 
 # make ctrl-a / ctrl-e shorctus work https://stackoverflow.com/questions/23128353/zsh-shortcut-ctrl-a-not-working
 bindkey -e

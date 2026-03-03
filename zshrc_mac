@@ -1,6 +1,6 @@
 # zshrc_mac
 # Symlink this to ~/.zshrc:  ln -sf ~/repos/dotfiles/zshrc_mac ~/.zshrc
-source "${0:A:h}/zshrc_common"
+source "${${:-$HOME/.zshrc}:A:h}/zshrc_common"
 
 # Repos checked out on this machine (edit per machine)
 REPOS=(sarlet dolphin disp-s1 opera_utils sweets apertools COMPASS s1-reader tophu snaphu-py)
