@@ -19,13 +19,14 @@ git clone git@github.com:scottstanie/dotfiles.git ~/repos/dotfiles
 
 **macOS:**
 ```bash
-brew install spaceship
+brew install spaceship font-fira-code
 ```
 
 **Linux:**
 ```bash
-mkdir -p ~/.zsh
-git clone https://github.com/spaceship-prompt/spaceship-zsh-theme.git ~/.zsh/spaceship
+mkdir -p "$HOME/.zsh"
+git clone --depth=1 https://github.com/spaceship-prompt/spaceship-prompt.git "$HOME/.zsh/spaceship"
+sudo apt install fonts-firacode
 ```
 
 `zshrc_common` auto-detects and sources it from either location.
@@ -63,6 +64,11 @@ conda init zsh
 `zshrc_mac` auto-detects whichever is installed (or both).
 
 ## 7. Common tools
+
+**uv**
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
 **Rust:**
 ```bash

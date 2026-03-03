@@ -3,7 +3,7 @@
 source "${0:A:h}/zshrc_common"
 
 # Repos checked out on this machine (edit per machine)
-REPOS=(dolphin disp-s1 opera_utils sweets apertools COMPASS s1-reader tophu snaphu-py)
+REPOS=(sarlet dolphin disp-s1 opera_utils sweets apertools COMPASS s1-reader tophu snaphu-py)
 
 # ISCE2 (comment out if not installed)
 export ISCE_BUILD_ROOT="${REPODIR}/isce2/build/"
@@ -27,10 +27,6 @@ eval "$(/opt/homebrew/bin/brew shellenv)"
 export path=("/opt/homebrew/opt/ruby/bin" $path)
 
 # Utilities
-function reload_vpn() {
-    sudo launchctl unload -w /Library/LaunchDaemons/net.pulsesecure.AccessService.plist
-    sudo launchctl load -w /Library/LaunchDaemons/net.pulsesecure.AccessService.plist
-}
 nisar2nc() {
     for src in "$@"; do
         [[ -f "$src" && "${src##*.}" == "h5" ]] || { echo "skipping $src"; continue }
