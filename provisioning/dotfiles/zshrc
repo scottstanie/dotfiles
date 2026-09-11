@@ -1,0 +1,46 @@
+# ~/.zshrc -- managed by data-tools/provisioning
+# Login shell config. Shared aliases/functions live in ~/.config/shell/common.sh.
+
+# --- History ---
+HISTSIZE=50000
+SAVEHIST=50000
+HISTFILE=~/.zsh_history
+setopt APPEND_HISTORY EXTENDED_HISTORY HIST_IGNORE_ALL_DUPS SHARE_HISTORY
+
+# --- Prompt: spaceship when installed, else the zsh builtin ---
+if [ -f "$HOME/.zsh/spaceship/spaceship.zsh" ]; then
+    . "$HOME/.zsh/spaceship/spaceship.zsh"          # bootstrap.sh --only spaceship
+else
+    autoload -Uz promptinit && promptinit
+    prompt adam1
+fi
+
+# --- Emacs keybindings (even with EDITOR=vim) ---
+bindkey -e
+
+# --- Completion ---
+autoload -Uz compinit && compinit
+zstyle ':completion:*' menu select
+zstyle ':completion:*' matcher-list '' 'm:{a-z}={A-Z}' 'm:{a-zA-Z}={A-Za-z}'
+if [ -x /usr/bin/dircolors ]; then
+    eval "$(dircolors -b)"
+    zstyle ':completion:*:default' list-colors ${(s.:.)LS_COLORS}
+fi
+
+# --- PATH (deduplicated) ---
+typeset -U path
+path=("$HOME/.local/bin" "$HOME/bin" "/usr/local/bin" "/usr/local/sbin" $path)
+
+# --- Tool environments (only if installed) ---
+[ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"    # uv
+[ -f "$HOME/.cargo/env" ]     && . "$HOME/.cargo/env"        # rust
+[ -d "$HOME/.pixi/bin" ]      && path=("$HOME/.pixi/bin" $path)
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ]         && . "$NVM_DIR/nvm.sh"
+[ -s "$NVM_DIR/bash_completion" ] && . "$NVM_DIR/bash_completion"
+
+# --- Shared aliases / functions ---
+[ -f "$HOME/.config/shell/common.sh" ] && . "$HOME/.config/shell/common.sh"
+
+# --- Secrets (untracked; copy secrets.example.sh -> secrets.sh) ---
+[ -f "$HOME/.config/shell/secrets.sh" ] && . "$HOME/.config/shell/secrets.sh"

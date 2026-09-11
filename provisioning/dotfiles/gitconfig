@@ -1,0 +1,11 @@
+[user]
+	email = scott.stanie@gmail.com
+	name = Scott Staniewicz
+[core]
+	editor = vim
+[credential]
+	helper = store
+[init]
+	defaultBranch = main
+[pull]
+	ff = only

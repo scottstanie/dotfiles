@@ -1,0 +1,37 @@
+" ~/.vimrc -- managed by data-tools/provisioning
+" Plugin-free, fast: for quick edits over ssh. For real editing use `nvim`
+" (LSP config lives in ~/.config/nvim/init.lua).
+
+set nocompatible
+syntax on
+filetype plugin indent on
+
+" Usability
+set wildmenu
+set showcmd
+set hlsearch
+set ignorecase
+set smartcase
+set backspace=indent,eol,start
+set autoindent
+set ruler
+set laststatus=2
+set number
+set visualbell
+set t_vb=
+
+" Indentation: 4 spaces
+set expandtab
+set shiftwidth=4
+set tabstop=4
+autocmd Filetype javascript,html,css,json,yaml setlocal ts=2 sts=2 sw=2
+autocmd Filetype make setlocal noexpandtab
+
+" Colorscheme
+set background=dark
+silent! colorscheme elflord
+
+" Mappings (kept from the old config)
+imap jk <Esc>
+nnoremap <C-L> :nohl<CR><C-L>
+nnoremap <Leader>s :%s/\<<C-r><C-w>\>//g<Left><Left>
