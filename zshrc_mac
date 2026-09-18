@@ -86,3 +86,10 @@ if [[ -f "$HOME/miniforge3/bin/conda" ]]; then
     fi
     unset __conda_setup
 fi
+
+export PATH="/Users/staniewi/.pixi/bin:$PATH"
+
+# Added by LM Studio CLI (lms)
+export PATH="$PATH:/Users/staniewi/.lmstudio/bin"
+# End of LM Studio CLI section
+

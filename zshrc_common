@@ -161,3 +161,7 @@ export LSCOLORS=GxFxCxDxBxegedabagaced
 
 # Jekyll
 alias js='bundle exec jekyll serve'
+
+# Download s3
+s3dl() { curl -fL --retry 3 -C - -o "$(basename "${1%%\?*}")" "$1"; }
+
