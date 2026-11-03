@@ -1,0 +1,3 @@
+# Never commit real secrets or local backups
+dotfiles/shell/secrets.sh
+*.bak-*

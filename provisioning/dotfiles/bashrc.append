@@ -1,0 +1,11 @@
+# >>> data-tools/provisioning >>>
+# Appended by bootstrap.sh so bash sessions get the same env as zsh.
+export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/local/sbin:$PATH"
+[ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"    # uv
+[ -f "$HOME/.cargo/env" ]     && . "$HOME/.cargo/env"        # rust
+[ -d "$HOME/.pixi/bin" ]      && export PATH="$HOME/.pixi/bin:$PATH"
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+[ -f "$HOME/.config/shell/common.sh" ] && . "$HOME/.config/shell/common.sh"
+[ -f "$HOME/.config/shell/secrets.sh" ] && . "$HOME/.config/shell/secrets.sh"
+# <<< data-tools/provisioning <<<
