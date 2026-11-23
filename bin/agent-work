@@ -1,13 +1,28 @@
 #!/usr/bin/env python3
 """Implement and review one work package in a fresh Git worktree.
 
-    agent-work BRIEF.md --check 'cargo test'             # build, check, review, showing each step
-    agent-work - --name NAME --check CMD <<'EOF'         # brief from stdin
-    agent-work BRIEF.md --check CMD --detach             # the same in the background
+    agent-work BRIEF.md --name NAME                      # build, check, review, showing each step
+    agent-work BRIEF.md --name NAME --detach             # the same in the background
+    agent-work - --name NAME <<'EOF'                     # brief from stdin
+    agent-work BRIEF.md --dry-run                        # show the settings a run would use
     agent-work --list                                    # recent runs and their state
     agent-work --resume RUN [--check CMD] [--repairs N]  # continue a stopped run
-    agent-work BRIEF.md --check CMD --needs /Volumes/WD_BLACK_SN7100_4TB --needs ssh:rpi5
+    agent-work BRIEF.md --needs /Volumes/WD_BLACK_SN7100_4TB --needs ssh:rpi5
                                                          # stop at once if the drive or host is missing
+
+The repository's .agent-work.toml gives the checks and other defaults, so a run needs only a brief
+and a name. A flag replaces the file's value. For example:
+
+    builder = "codex"                 # opus or codex; the other one reviews
+    effort = "medium"                 # low, medium, high or xhigh
+    checks = ["cargo test --locked"]  # required before review; a failure goes back to the builder
+    final_checks = []                 # required after a clean review
+    needs = ["ssh:rpi5"]              # drives, folders or ssh:HOST, checked before any agent starts
+    repairs = 2                       # repair turns after the first attempt
+    timeout = 30                      # minutes per agent turn or check
+
+    [env]                             # for the checks only, not the builder; ~ is expanded
+    CARGO_TARGET_DIR = "~/.cache/agent-work/target-myrepo"
 
 The builder edits the worktree. The runner commits exactly the files the builder names and runs the
 checks. Then the other provider reviews the candidate read-only. Findings go back to the builder for
@@ -30,9 +45,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from contextlib import nullcontext, suppress
 from datetime import datetime
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from agentfeed import Feed, duration, shorten  # noqa: E402  (next to this script)
 
 
 POLL_SECONDS = 5
@@ -41,6 +60,9 @@ CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "agent-
 LEVELS = ("low", "medium", "high", "xhigh")
 CLEAN, FINDINGS, UNCERTAIN = "VERDICT: CLEAN", "VERDICT: FINDINGS", "VERDICT: UNCERTAIN"
 READY = "READY FOR YOUR REVIEW"
+REPO_CONFIG = ".agent-work.toml"
+CONFIG_TYPES = {"builder": str, "effort": str, "checks": list, "final_checks": list, "needs": list,
+                "repairs": int, "timeout": int, "env": dict}
 
 BUILDER_PROMPT = """\
 Work on this one task in the current Git worktree. The base is {base}.
@@ -73,8 +95,10 @@ REVIEW_PROMPT = """\
 Independently review candidate {commit} against base {base}. Read the task
 at {brief} and the exact candidate patch at {diff}.
 The checkout is at the candidate commit.
-Read relevant source and tests. The pre-review checks passed. Any final
-checks configured by the caller run after a clean review.
+Read relevant source and tests. The runner ran these checks on this commit,
+outside any sandbox, and they passed:
+{checks}
+Any final checks configured by the caller run after a clean review.
 Check the brief's acceptance criteria and identify material regressions.
 Assess earlier findings and the builder's response, including disputes.
 Treat the reports as evidence to verify, including any advisory from AGY.
@@ -170,15 +194,6 @@ def activity(folder, message, *, show=False):
         print(line, end="", flush=True)
 
 
-def duration(seconds):
-    seconds = int(seconds)
-    return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
-
-
-def shorten(text, width):
-    return text if len(text) <= width else text[:width - 1] + "…"
-
-
 def show(path):
     """A path for printed commands: ~ for the home folder, quoted where needed."""
     path, home = str(path), str(Path.home())
@@ -204,6 +219,39 @@ def check_needs(needs):
                        hint="Plug in the drive or bring up the host, then run the same command again.")
 
 
+def load_config(repo):
+    """The settings in <repo>/.agent-work.toml, checked; an empty dict without the file."""
+    path = repo / REPO_CONFIG
+    if not path.is_file():
+        return {}
+    try:
+        config = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as error:
+        raise RunError(f"{show(path)} is not valid TOML: {error}") from error
+    problems = []
+    for key, value in config.items():
+        kind = CONFIG_TYPES.get(key)
+        if kind is None:
+            problems.append(f"unknown setting {key!r} (known: {', '.join(CONFIG_TYPES)})")
+        elif type(value) is not kind:
+            problems.append(f"{key} must be a TOML {'table' if kind is dict else kind.__name__}")
+        elif kind is list and not all(isinstance(item, str) and item.strip() for item in value):
+            problems.append(f"{key} must hold nonempty strings")
+        elif kind is dict and not all(isinstance(item, str) for item in value.values()):
+            problems.append(f"every value under [{key}] must be a string")
+    if problems:
+        raise RunError(f"{show(path)} has settings agent-work cannot use", details=problems)
+    if config.get("builder", "opus") not in ("opus", "codex"):
+        problems.append("builder must be opus or codex")
+    if config.get("effort", "xhigh") not in LEVELS:
+        problems.append(f"effort must be one of {', '.join(LEVELS)}")
+    if config.get("repairs", 0) < 0 or config.get("timeout", 1) < 1:
+        problems.append("repairs must be 0 or more and timeout 1 or more")
+    if problems:
+        raise RunError(f"{show(path)} has settings agent-work cannot use", details=problems)
+    return config
+
+
 def command_name():
     """How to call this script again, for printed instructions."""
     name = Path(sys.argv[0]).name
@@ -220,96 +268,6 @@ def notify(title, message):
                         "-e", "end run", title, message], capture_output=True)
     elif shutil.which("notify-send"):
         subprocess.run(["notify-send", title, message], capture_output=True)
-
-
-class Feed:
-    """Short lines about what a running tool is doing, read from the new part of its log."""
-
-    def __init__(self, kind, path, prefixes):
-        self.kind, self.path = kind, path
-        self.prefixes = [f"{prefix}/" for prefix in prefixes]
-        self.offset = 0
-        self.expect = None
-        self.edits = []
-        self.script = []
-
-    def lines(self):
-        with self.path.open("rb") as stream:
-            stream.seek(self.offset)
-            data = stream.read()
-        end = data.rfind(b"\n") + 1
-        self.offset += end
-        new = data[:end].decode("utf-8", errors="replace").splitlines()
-        if self.kind == "codex":
-            return list(self.codex(new))
-        if self.kind == "claude":
-            return list(self.claude(new))
-        return [line.strip() for line in new if line.strip()][-1:]
-
-    def relative(self, text):
-        for prefix in self.prefixes:
-            text = text.replace(prefix, "")
-        return text
-
-    def codex(self, lines):
-        """codex exec prints blocks headed by a line `exec`, `codex` or `apply patch`."""
-        for line in lines:
-            if self.expect == "patch":
-                if line.startswith("/"):
-                    self.edits.append(self.relative(line))
-                    continue
-                if line.startswith("patch:"):
-                    if line != "patch: completed":
-                        yield line
-                    continue
-                self.expect = None
-                if self.edits:
-                    yield "edited " + ", ".join(self.edits)
-                    self.edits = []
-            if self.expect == "exec":
-                # The command, possibly over several lines, ends with ` in <workdir>`.
-                match = re.fullmatch(r"(.*) in (/\S*)", line)
-                if match or not re.match(r" (succeeded|exited) ", line):
-                    self.script.append(match[1] if match else line)
-                    if not match:
-                        continue
-                self.expect = None
-                yield "$ " + self.command(self.script)
-                self.script = []
-                if match:
-                    continue
-            if self.expect == "codex":
-                if line.strip():
-                    self.expect = None
-                    yield "codex: " + line.strip()
-            elif line in ("exec", "codex", "apply patch"):
-                self.expect = "patch" if line == "apply patch" else line
-            elif match := re.fullmatch(r" exited (-?\d+) in \S+:", line):
-                yield f"  exit {match[1]}"
-
-    def command(self, lines):
-        command = re.sub(r"^\S*/(?:ba|z)?sh -l?c ", "", " ⏎ ".join(line.strip() for line in lines))
-        quote = command[:1]
-        if quote in ("'", '"'):
-            command = command[1:].removesuffix(quote)
-        return self.relative(command)
-
-    def claude(self, lines):
-        """claude -p --output-format stream-json prints one JSON event per line."""
-        for line in lines:
-            event = json.loads(line)
-            if event["type"] != "assistant":
-                continue
-            for item in event["message"]["content"]:
-                if item["type"] == "text" and item["text"].strip():
-                    yield "claude: " + item["text"].strip().splitlines()[0]
-                elif item["type"] == "tool_use" and item["name"] == "Bash":
-                    yield "$ " + self.relative(item["input"]["command"].splitlines()[0])
-                elif item["type"] == "tool_use":
-                    data = item["input"]
-                    value = next((data[key] for key in ("file_path", "pattern", "path", "url", "query")
-                                  if isinstance(data.get(key), str)), "")
-                    yield f"{item['name']} {self.relative(value)}".rstrip()
 
 
 def watch(process, feed, stage, folder, timeout):
@@ -336,7 +294,7 @@ def watch(process, feed, stage, folder, timeout):
             last_news = now
 
 
-def step(argv, cwd, path, timeout, prompt=None, *, kind, output=None):
+def step(argv, cwd, path, timeout, prompt=None, *, kind, output=None, env=None):
     """Run one tool with full logs and a live feed. Kill its process group if the runner stops."""
     folder = path.parent
     prompt_path = path.with_suffix(".prompt.md")
@@ -353,6 +311,7 @@ def step(argv, cwd, path, timeout, prompt=None, *, kind, output=None):
     ):
         process = subprocess.Popen(
             argv, cwd=cwd, stdin=source, stdout=answer, stderr=log, start_new_session=True,
+            env=None if env is None else {**os.environ, **env},
         )
         activity(folder, f"{stage} started, PID {process.pid}. Logs: {log_names}", show=True)
         feed = Feed(kind, output if kind == "claude" else log_path, [cwd, folder])
@@ -483,6 +442,8 @@ class Run:
             f"- Final checks: {', '.join(f'`{c}`' for c in state['final_checks']) or 'none'}",
             f"- Repair turns: {state['repairs']}",
             f"- Needs: {', '.join(state['needs']) or 'nothing'}",
+            f"- Check environment: {', '.join(f'`{k}={v}`' for k, v in state['env'].items()) or 'unchanged'}",
+            f"- Settings file: {state['config'] or 'none'}",
             "- Brief: [brief.md](brief.md)",
             "- Live activity: [activity.log](activity.log)",
             "", *state["events"],
@@ -589,7 +550,8 @@ def run_checks(run, commands, *, final):
         run.note(f"- {label} running: `{command}` ([log]({log.name}))")
         failure = None
         try:
-            step(["/bin/sh", "-c", command], run.worktree, log, run.state["timeout"] * 60, kind="sh")
+            step(["/bin/sh", "-c", command], run.worktree, log, run.state["timeout"] * 60, kind="sh",
+                 env=run.state["env"])
         except RunError as error:
             failure = error
         require_clean(run, f"the {label.lower()} `{command}` {'failed and ' if failure else ''}"
@@ -629,6 +591,7 @@ def review(run):
         require_clean(run, "the AGY advisory changed the worktree", READ_ONLY_CHANGED)
 
     prompt = REVIEW_PROMPT.format(commit=state["commit"], base=state["base"], brief=context / "brief.md",
+                                  checks="\n".join(f"- `{command}`" for command in state["checks"]),
                                   diff=context / "candidate.diff", review_feedback=state["review_feedback"],
                                   reply=state["reply"], advisory=advisory)
     report = run.folder / f"{tag}-review.md"
@@ -813,32 +776,44 @@ def find_run(name):
 
 
 def start(args, parser):
-    if args.brief is None or not args.check:
-        parser.error("a new run needs a brief and at least one --check")
+    if args.brief is None:
+        parser.error("a new run needs a brief")
     if args.name is not None and (not args.name.strip() or len(args.name.splitlines()) != 1
                                   or args.name != args.name.strip()):
         parser.error("--name must be one nonempty line without leading or trailing whitespace")
-    repairs = 2 if args.repairs is None else args.repairs
-    timeout = 30 if args.timeout is None else args.timeout
     brief = read_brief(args.brief, args.package)
     repo = Path(git(args.repo, "rev-parse", "--show-toplevel").strip())
     base = git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.base}^{{commit}}").strip()
+    config = load_config(repo)
+    # A flag replaces the settings file's value, which replaces the built-in default.
+    pick = lambda flag, key, default: flag if flag is not None else config.get(key, default)
+    builder, effort = pick(args.builder, "builder", "opus"), pick(args.effort, "effort", "xhigh")
+    checks, final_checks = pick(args.check, "checks", []), pick(args.final_check, "final_checks", [])
+    needs = pick(args.needs, "needs", [])
+    repairs, timeout = pick(args.repairs, "repairs", 2), pick(args.timeout, "timeout", 30)
+    env = {key: os.path.expanduser(value) for key, value in config.get("env", {}).items()}
+    if not checks:
+        parser.error(f"a new run needs at least one check: --check COMMAND, or checks in {repo / REPO_CONFIG}")
     task = args.name or args.package or ("task" if args.brief == Path("-") else args.brief.stem)
-    reviewer = "codex" if args.builder == "opus" else "opus"
+    reviewer = "codex" if builder == "opus" else "opus"
     efforts = {
-        "opus": args.opus_effort or args.effort,
-        "codex": args.codex_effort or args.effort,
+        "opus": args.opus_effort or effort,
+        "codex": args.codex_effort or effort,
         "agy": args.agy_effort,
     }
-    check_needs(args.needs or [])
+    check_needs(needs)
     if args.dry_run:
+        listing = lambda items: "".join(f"\n    {item}" for item in items) or " none"
         print(f"{repo} @ {base}\n"
+              f"Settings file: {show(repo / REPO_CONFIG) if config else 'none'}\n"
               f"Task: {task}\n"
-              f"Builder: {args.builder} (effort: {efforts[args.builder]})\n"
+              f"Builder: {builder} (effort: {efforts[builder]})\n"
               f"Reviewer: {reviewer} (effort: {efforts[reviewer]})\n"
               f"AGY advisory: {efforts['agy'] if args.agy else 'off'}\n"
-              f"Checks: {args.check!r}\nFinal checks: {args.final_check or []!r}\n"
-              f"Repair turns: {repairs}\nNeeds (available): {args.needs or []!r}\n\n{brief.rstrip()}")
+              f"Checks:{listing(checks)}\nFinal checks:{listing(final_checks)}\n"
+              f"Check environment:{listing(f'{k}={v}' for k, v in env.items())}\n"
+              f"Repair turns: {repairs}\nTimeout: {timeout} minutes\n"
+              f"Needs (available):{listing(needs)}\n\n{brief.rstrip()}")
         return 0
     for cli in ("claude", "codex", *(["agy"] if args.agy else [])):
         if shutil.which(cli) is None:
@@ -852,10 +827,11 @@ def start(args, parser):
         "task": task,
         "source": "stdin" if args.brief == Path("-") else str(args.brief.resolve()),
         "repo": str(repo), "base": base, "branch": f"agent-work/{folder.name}", "worktree": str(worktree),
-        "builder": args.builder, "reviewer": reviewer, "efforts": efforts,
+        "builder": builder, "reviewer": reviewer, "efforts": efforts,
         "agy": args.agy, "agy_pending": args.agy,
-        "checks": args.check, "final_checks": args.final_check or [],
-        "repairs": repairs, "timeout": timeout, "needs": args.needs or [],
+        "checks": checks, "final_checks": final_checks, "env": env,
+        "config": str(repo / REPO_CONFIG) if config else None,
+        "repairs": repairs, "timeout": timeout, "needs": needs,
         "attempt": 0, "phase": "build", "commit": base,
         "reply": "", "pending_reply": "", "review_feedback": "", "check_feedback": "", "last_report": "",
         "resumes": 0, "status": "STARTING", "pid": None, "stop": None, "events": [],
@@ -897,13 +873,14 @@ def main():
     parser.add_argument("--repo", type=Path, default=Path("."), help="target repository (default: current directory)")
     parser.add_argument("--base", default="main", help="local Git ref to build on (default: main)")
     parser.add_argument("--check", action="append", metavar="COMMAND",
-                        help="required shell check run by the runner (repeatable; with --resume, replaces the run's checks)")
+                        help="required shell check run by the runner (repeatable; replaces the settings "
+                             "file's checks, and with --resume the run's)")
     parser.add_argument("--final-check", action="append", metavar="COMMAND",
-                        help="required shell check run after a clean review (repeatable; with --resume, replaces)")
-    parser.add_argument("--builder", choices=["opus", "codex"], default="opus",
+                        help="required shell check run after a clean review (repeatable; replaces, as --check)")
+    parser.add_argument("--builder", choices=["opus", "codex"],
                         help="implementer; the other provider is the primary reviewer (default: opus)")
     parser.add_argument("--agy", action="store_true", help="request an advisory review of the first reviewed candidate")
-    parser.add_argument("--effort", choices=LEVELS, default="xhigh",
+    parser.add_argument("--effort", choices=LEVELS,
                         help="reasoning effort for both Opus and Codex (default: xhigh)")
     parser.add_argument("--opus-effort", choices=(*LEVELS, "max"), help="override --effort for Opus")
     parser.add_argument("--codex-effort", choices=LEVELS, help="override --effort for Codex")

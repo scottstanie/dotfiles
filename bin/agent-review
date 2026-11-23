@@ -23,6 +23,8 @@ Each round:
   2. the fixer reads all reports, fixes or rejects each finding with a reason, and runs tests.
      This script then commits what it changed, on the current branch. Nothing is merged or pushed.
 The loop stops early when every reviewer says CLEAN, or when the fixer changes nothing.
+While the agents run, the terminal and activity.log in the output folder show each one's commands,
+reads, edits and messages. Ctrl-C stops every agent the script started.
 
 Config is merged in this order, later wins: built-in defaults, ~/.config/agent-review/config.toml,
 <repo>/.agent-review.toml, --config FILE, then command-line flags. Output goes to
@@ -32,16 +34,26 @@ Config is merged in this order, later wins: built-in defaults, ~/.config/agent-r
 import argparse
 import copy
 import datetime
+import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
+import time
 import tomllib
+from contextlib import suppress
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from agentfeed import Feed, duration, shorten  # noqa: E402  (next to this script)
 
 USER_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "agent-review" / "config.toml"
 REPO_CONFIG = ".agent-review.toml"
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "agent-review"
+POLL_SECONDS = 5
+QUIET_SECONDS = 120
 
 DEFAULTS = {
     "base": "main",
@@ -192,7 +204,8 @@ def validate(cfg):
 
 
 def command(agent, role, prompt, report):
-    """The argv, the stdin text, and whether the report arrives on stdout."""
+    """The argv, the stdin text, and where the report comes from: "file" (the CLI writes it),
+    "stdout", or "events" (claude's stream of JSON events on stdout, which ends with the answer)."""
     kind = agent["kind"]
     model, effort = agent.get("model", ""), agent.get("effort", "")
     extra = list(agent.get(f"{role}_args", ROLE_ARGS[kind][role])) + list(agent.get("args", []))
@@ -202,45 +215,120 @@ def command(agent, role, prompt, report):
             argv += ["-m", model]
         if effort:
             argv += ["-c", f'model_reasoning_effort="{effort}"']
-        return argv + ["-"], prompt, False
+        return argv + ["-"], prompt, "file"
     if kind == "claude":
-        argv = ["claude", "-p", "--output-format", "text"]
+        argv = ["claude", "-p", "--output-format", "stream-json", "--verbose"]
         if model:
             argv += ["--model", model]
         if effort:
             argv += ["--effort", effort]
-        return argv + extra, prompt, True
+        return argv + extra, prompt, "events"
     argv = ["agy"]  # agy
     if model:
         argv += ["--model", model]
     if effort:
         argv += ["--effort", effort]
-    return argv + extra + ["-p", prompt], None, True
+    return argv + extra + ["-p", prompt], None, "stdout"
 
 
-def start(agent, role, prompt, report, log, dry):
-    argv, stdin, to_stdout = command(agent, role, prompt, report)
+def say(out, text):
+    """Print a line and add it to activity.log, for `tail -F` from another terminal. A dry run
+    has no output folder, so nothing is logged."""
+    print(text, flush=True)
+    if out.is_dir():
+        with (out / "activity.log").open("a") as log:
+            log.write(f"{datetime.datetime.now():%H:%M:%S} {text}\n")
+
+
+class Job:
+    """One running agent: its process, its files and the feed of what it is doing."""
+
+    def __init__(self, name, agent, role, prompt, report, log, out):
+        argv, stdin, source = command(agent, role, prompt, report)
+        self.name, self.role, self.report, self.log = name, role, report, log
+        self.events = report.with_suffix(".events.jsonl") if source == "events" else None
+        err = open(log, "w")
+        if source == "file":
+            answer = err
+        else:
+            answer = open(self.events if self.events else report, "w")
+        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
+                                     stdout=answer, stderr=subprocess.STDOUT if answer is err else err,
+                                     text=True, start_new_session=True)
+        if stdin:
+            self.proc.stdin.write(stdin)
+            self.proc.stdin.close()
+        self.feed = Feed(agent["kind"], self.events or log, [Path.cwd(), out], say="")
+        self.started = time.monotonic()
+        say(out, f"  {name} started ({role}), PID {self.proc.pid}. Log: {log}")
+
+    def kill(self):
+        with suppress(ProcessLookupError):
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        self.proc.wait()
+
+    def answer(self):
+        """The report, after a successful exit."""
+        code = self.proc.returncode
+        assert code == 0, f"{self.name} exited with {code}; see {self.log}"
+        if self.events:
+            results = [event for event in map(json.loads, self.events.read_text().splitlines())
+                       if event["type"] == "result"]
+            assert results and results[-1]["subtype"] == "success" and not results[-1]["is_error"], \
+                f"{self.name} did not finish with a successful result; see {self.events}"
+            self.report.write_text(results[-1]["result"])
+        text = Path(self.report).read_text().strip()
+        assert text, f"{self.name} wrote an empty report; see {self.log}"
+        return text
+
+
+def show_command(agent, role, prompt, report):
+    argv, stdin, _ = command(agent, role, prompt, report)
     shown = [f"<prompt, {len(a)} chars>" if a == prompt else a for a in argv]
     print(f"  $ {' '.join(shown)}" + ("  < prompt" if stdin else ""), flush=True)
+
+
+def wait(jobs, out):
+    """Wait for the agents, printing what each does. Returns their reports, by name. If one fails
+    or the script is stopped, the others are killed."""
+    width = shutil.get_terminal_size((160, 24)).columns - 14
+    pending = {job.name: job for job in jobs}
+    reports = {}
+    last_news = time.monotonic()
+    try:
+        while pending:
+            with suppress(subprocess.TimeoutExpired):
+                next(iter(pending.values())).proc.wait(timeout=POLL_SECONDS)
+            now = time.monotonic()
+            for name, job in list(pending.items()):
+                for line in job.feed.lines():
+                    say(out, shorten(f"  {name} | {line}", width))
+                    last_news = now
+                if job.proc.poll() is not None:
+                    del pending[name]
+                    reports[name] = job.answer()
+                    result = f": {verdict(reports[name])}" if job.role == "review" else ""
+                    say(out, f"  {name} finished after {duration(now - job.started)}{result}")
+            if pending and now - last_news >= QUIET_SECONDS:
+                say(out, "  (" + ", ".join(f"{n} {duration(now - j.started)} in" for n, j in pending.items())
+                    + f"; nothing new for {duration(now - last_news)})")
+                last_news = now
+    except BaseException:
+        for job in pending.values():
+            job.kill()
+        raise
+    return {job.name: reports[job.name] for job in jobs}
+
+
+def agents(cfg, role, prompts, out, dry):
+    """Run the named agents at once with their prompts; prompts maps a name to (prompt, file stem)."""
+    for name, (prompt, stem) in prompts.items():
+        show_command(cfg["agents"][name], role, prompt, out / f"{stem}.md")
     if dry:
-        return None
-    err = open(log, "w")
-    out = open(report, "w") if to_stdout else err
-    proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
-                            stdout=out, stderr=err if to_stdout else subprocess.STDOUT, text=True)
-    if stdin:
-        proc.stdin.write(stdin)
-        proc.stdin.close()
-    return proc, report, log
-
-
-def finish(job, name):
-    proc, report, log = job
-    code = proc.wait()
-    assert code == 0, f"{name} exited with {code}; see {log}"
-    text = Path(report).read_text().strip()
-    assert text, f"{name} wrote an empty report; see {log}"
-    return text
+        return {name: "VERDICT: FINDINGS" for name in prompts}
+    jobs = [Job(name, cfg["agents"][name], role, prompt, out / f"{stem}.md", out / f"{stem}.log", out)
+            for name, (prompt, stem) in prompts.items()]
+    return wait(jobs, out)
 
 
 def tree_state():
@@ -267,6 +355,8 @@ def run(cfg, out, dry):
         out.mkdir(parents=True, exist_ok=True)
     print(f"reviewing {branch} against {base}: {cfg['rounds']} round(s), {cfg['mode']}, "
           f"reviewers {', '.join(cfg['reviewers'])}, fixer {cfg['fixer']}\nout: {out}", flush=True)
+    if not dry:
+        print(f"watch from another terminal: tail -F {out / 'activity.log'}", flush=True)
     focus = f"\nFocus: {cfg['focus']}\n" if cfg["focus"] else ""
     summary = [f"# agent-review: `{branch}` against `{base}`\n",
                f"{cfg['mode']}, reviewers {', '.join(cfg['reviewers'])}, fixer {cfg['fixer']}, "
@@ -274,38 +364,29 @@ def run(cfg, out, dry):
     history = ""
 
     for rnd in range(1, cfg["rounds"] + 1):
-        print(f"\nround {rnd}", flush=True)
+        say(out, f"\nround {rnd}")
         before = tree_state()
         reports = {}
         if cfg["mode"] == "parallel":
-            jobs = {}
-            for name in cfg["reviewers"]:
-                prompt = REVIEW_PROMPT.format(branch=branch, base=base, focus=focus, history=history, chain="")
-                jobs[name] = start(cfg["agents"][name], "review", prompt,
-                                   out / f"r{rnd}-{name}.md", out / f"r{rnd}-{name}.log", dry)
-            if dry:
-                reports = {n: "VERDICT: FINDINGS" for n in jobs}
-            else:
-                reports = {n: finish(j, n) for n, j in jobs.items()}
+            prompt = REVIEW_PROMPT.format(branch=branch, base=base, focus=focus, history=history, chain="")
+            reports = agents(cfg, "review", {n: (prompt, f"r{rnd}-{n}") for n in cfg["reviewers"]}, out, dry)
         else:
             for name in cfg["reviewers"]:
                 chain = "".join(f"\nAn earlier reviewer ({n}) reported this round:\n\n{r}\n" for n, r in reports.items())
                 if chain:
                     chain += "\nConfirm or dispute their findings where you have evidence, and add what they missed.\n"
                 prompt = REVIEW_PROMPT.format(branch=branch, base=base, focus=focus, history=history, chain=chain)
-                job = start(cfg["agents"][name], "review", prompt,
-                            out / f"r{rnd}-{name}.md", out / f"r{rnd}-{name}.log", dry)
-                reports[name] = "VERDICT: FINDINGS" if dry else finish(job, name)
+                reports |= agents(cfg, "review", {name: (prompt, f"r{rnd}-{name}")}, out, dry)
         if not dry:
             assert tree_state() == before, "a reviewer changed the working tree or HEAD; see `git status`"
 
         verdicts = {n: verdict(r) for n, r in reports.items()}
         if not dry:
-            print("  verdicts: " + ", ".join(f"{n} {v}" for n, v in verdicts.items()), flush=True)
+            say(out, "  verdicts: " + ", ".join(f"{n} {v}" for n, v in verdicts.items()))
         summary.append(f"\n## Round {rnd}\n\nVerdicts: " + ", ".join(f"{n} **{v}**" for n, v in verdicts.items()) + "\n")
         summary += [f"\n### {n}\n\n{r}\n" for n, r in reports.items()]
         if all(v == "CLEAN" for v in verdicts.values()):
-            print("  every reviewer says CLEAN; stopping", flush=True)
+            say(out, "  every reviewer says CLEAN; stopping")
             break
         if cfg["fixer"] == "none":
             continue
@@ -313,14 +394,13 @@ def run(cfg, out, dry):
         joined = "\n\n".join(f"## Report from {n}\n\n{r}" for n, r in reports.items())
         prompt = FIX_PROMPT.format(branch=branch, base=base, round=rnd, reports=joined)
         fixer = cfg["fixer"]
-        job = start(cfg["agents"][fixer], "fix", prompt, out / f"r{rnd}-fix-{fixer}.md", out / f"r{rnd}-fix-{fixer}.log", dry)
+        response = agents(cfg, "fix", {fixer: (prompt, f"r{rnd}-fix-{fixer}")}, out, dry)[fixer]
         if dry:
             continue
-        response = finish(job, fixer)
         summary.append(f"\n### Fixer ({fixer})\n\n{response}\n")
         commit = commit_fixes(before, response, rnd)
         summary.append(f"\nCommit: {commit or 'none'}\n")
-        print(f"  fixer committed {commit}" if commit else "  fixer changed nothing; stopping", flush=True)
+        say(out, f"  fixer committed {commit}" if commit else "  fixer changed nothing; stopping")
         if not commit:
             break
         history = (f"\nThis is review round {rnd + 1}. In round {rnd} the reviewers reported:\n\n{joined}\n\n"
@@ -356,6 +436,11 @@ def commit_fixes(before, response, rnd):
     return git("rev-parse", "--short", "HEAD")
 
 
+def interrupt(_signum, _frame):
+    """`kill` stops the agents too, as Ctrl-C does: they run in their own sessions."""
+    raise KeyboardInterrupt
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-C", "--repo", type=Path, default=Path("."), metavar="DIR",
@@ -374,6 +459,7 @@ def main():
     p.add_argument("--show-config", action="store_true", help="print the merged config and exit")
     p.add_argument("--init", action="store_true", help=f"write an example config to {USER_CONFIG}")
     args = p.parse_args()
+    signal.signal(signal.SIGTERM, interrupt)
 
     if args.init:
         assert not USER_CONFIG.exists(), f"{USER_CONFIG} exists; edit it instead"
@@ -397,7 +483,12 @@ def main():
     branch = git("rev-parse", "--abbrev-ref", "HEAD")
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = Path(args.out) if args.out else CACHE / top.name / f"{branch.replace('/', '-')}-{stamp}"
-    run(cfg, out.resolve(), args.dry_run)
+    try:
+        run(cfg, out.resolve(), args.dry_run)
+    except KeyboardInterrupt:
+        print(f"\ninterrupted: the agents were stopped. Their reports and logs so far are in {out}",
+              file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
