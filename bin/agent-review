@@ -1,0 +1,404 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Headless multi-agent review of the current branch: reviewers, then a fixer, for N rounds.
+
+    agent-review                         # review HEAD against main with the configured agents
+    agent-review --repo /path/to/worktree # review that worktree from any directory
+    agent-review --rounds 3 --mode chain # each reviewer sees the earlier reviewers' reports
+    agent-review --reviewers codex --fixer none
+    agent-review --set codex.effort=xhigh --set claude.model=sonnet
+    agent-review --focus "the new SSE route in serve.rs"
+    agent-review --dry-run               # print the commands without running anything
+    agent-review --show-config           # print the merged config
+    agent-review --init                  # write an example ~/.config/agent-review/config.toml
+
+Each round:
+  1. every reviewer reads `git diff BASE...HEAD` read-only and writes a report ending in
+     `VERDICT: CLEAN` or `VERDICT: FINDINGS`. In "parallel" mode they run at once and
+     independently; in "chain" mode they run in the listed order and each sees the earlier
+     reports of that round, to confirm, dispute or add to.
+  2. the fixer reads all reports, fixes or rejects each finding with a reason, and runs tests.
+     This script then commits what it changed, on the current branch. Nothing is merged or pushed.
+The loop stops early when every reviewer says CLEAN, or when the fixer changes nothing.
+
+Config is merged in this order, later wins: built-in defaults, ~/.config/agent-review/config.toml,
+<repo>/.agent-review.toml, --config FILE, then command-line flags. Output goes to
+~/.cache/agent-review/<repo>/<branch>-<time>/ (or --out), with a summary.md at the end.
+"""
+
+import argparse
+import copy
+import datetime
+import os
+import re
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+USER_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "agent-review" / "config.toml"
+REPO_CONFIG = ".agent-review.toml"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "agent-review"
+
+DEFAULTS = {
+    "base": "main",
+    "rounds": 2,
+    "mode": "parallel",
+    "reviewers": ["codex", "agy"],
+    "fixer": "claude",
+    "focus": "",
+    "agents": {
+        "codex": {"kind": "codex", "model": "", "effort": "high"},
+        "agy": {"kind": "agy", "model": "", "effort": "high"},
+        "claude": {"kind": "claude", "model": "", "effort": "high"},
+    },
+}
+
+EXAMPLE_CONFIG = '''\
+# agent-review config. Later files win: this one, then <repo>/.agent-review.toml, then flags.
+
+base = "main"
+rounds = 2
+mode = "parallel"               # "parallel": reviewers independent; "chain": in order, each sees the earlier ones
+reviewers = ["codex", "agy"]    # names from [agents.*]; order matters in chain mode
+fixer = "claude"                # a name from [agents.*], or "none" for review only
+focus = ""                      # extra instructions for every reviewer
+
+# kind is codex, claude or agy. model/effort "" means the CLI's own default.
+# review_args / fix_args replace the built-in permission flags for that role; args are added to both.
+
+[agents.codex]
+kind = "codex"
+model = ""                      # e.g. "gpt-5.5"
+effort = "high"                 # minimal | low | medium | high | xhigh
+
+[agents.agy]
+kind = "agy"
+model = ""                      # see `agy models`, e.g. "gemini-4-neon-high"
+effort = "high"                 # low | medium | high | xhigh | max
+
+[agents.claude]
+kind = "claude"
+model = ""                      # e.g. "opus", "sonnet"
+effort = "high"                 # low | medium | high | xhigh | max
+
+# A second profile of the same CLI, e.g. a cheap first pass: reviewers = ["codex-fast", "agy"]
+# [agents.codex-fast]
+# kind = "codex"
+# effort = "low"
+'''
+
+# Permission flags per kind and role. Reviewers must not change the tree (checked after each run);
+# the fixer edits files and runs tests without asking, and never commits (this script commits).
+ROLE_ARGS = {
+    "codex": {
+        "review": ["-s", "read-only"],
+        "fix": ["-s", "workspace-write"],
+    },
+    "claude": {
+        "review": ["--permission-mode", "dontAsk", "--allowedTools",
+                   "Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)"],
+        "fix": ["--permission-mode", "auto"],
+    },
+    "agy": {
+        "review": ["--sandbox", "--dangerously-skip-permissions"],
+        "fix": ["--sandbox", "--dangerously-skip-permissions"],
+    },
+}
+
+REVIEW_PROMPT = """\
+You are reviewing the changes on branch `{branch}` against `{base}` in this repository.
+This review is read-only: do not edit, create or delete any file, and do not run git commands that
+change anything.
+
+Run `git log {base}..HEAD` and `git diff {base}...HEAD`, and read whatever files you need.
+{focus}{history}{chain}
+Report correctness bugs and real problems only. For each: file:line, a concrete failure scenario
+(input or state, then the wrong result or crash), and a severity (high, medium or low). Most severe
+first. No style nits, no praise, no summary of the change.
+
+Your final message is the report, in markdown. Its last line must be exactly `VERDICT: CLEAN` if
+you found nothing worth changing, or `VERDICT: FINDINGS` otherwise.
+"""
+
+FIX_PROMPT = """\
+Reviewers have reviewed branch `{branch}` against `{base}` (round {round}). Their reports follow.
+
+{reports}
+
+For each finding, check it against the code. If it is real, fix it. If it is wrong or not worth
+changing, reject it with a one-line reason. Reviewers can be wrong; do not make a change you do not
+believe in. Run the tests relevant to what you change. Do not commit, merge, rebase or push; the
+caller commits your changes.
+
+Your final message: one line per finding, `FIXED`, `REJECTED` or `DEFERRED`, the finding in a few
+words, and the reason. Then one line `NEW FILES: <space-separated paths>` naming any files you
+created that belong in the commit (not test or build output), or `NEW FILES: none`. Then one line
+`COMMIT: <a one-line commit message for your changes>`, or `COMMIT: none` if you changed nothing.
+"""
+
+
+def git(*args):
+    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def merge(dst, src):
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            merge(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
+
+
+def parse_value(text):
+    try:
+        return tomllib.loads(f"v = {text}")["v"]
+    except tomllib.TOMLDecodeError:
+        return text
+
+
+def load_config(args, top):
+    cfg = copy.deepcopy(DEFAULTS)
+    for path in [USER_CONFIG, top / REPO_CONFIG, Path(args.config) if args.config else None]:
+        if path is not None and path.exists():
+            merge(cfg, tomllib.loads(path.read_text()))
+    for key in ["base", "rounds", "mode", "fixer", "focus"]:
+        if getattr(args, key) is not None:
+            cfg[key] = getattr(args, key)
+    if args.reviewers is not None:
+        cfg["reviewers"] = [r for r in args.reviewers.split(",") if r]
+    for item in args.set:
+        key, _, value = item.partition("=")
+        assert _ and "." in key, f"--set wants NAME.FIELD=VALUE, got {item!r}"
+        name, field = key.split(".", 1)
+        cfg["agents"].setdefault(name, {})[field] = parse_value(value)
+    validate(cfg)
+    return cfg
+
+
+def validate(cfg):
+    assert cfg["mode"] in ("parallel", "chain"), f"mode must be parallel or chain, not {cfg['mode']!r}"
+    assert isinstance(cfg["rounds"], int) and cfg["rounds"] >= 1, "rounds must be an integer >= 1"
+    assert cfg["reviewers"], "no reviewers"
+    names = cfg["reviewers"] + ([] if cfg["fixer"] == "none" else [cfg["fixer"]])
+    for name in names:
+        assert name in cfg["agents"], f"agent {name!r} is not defined under [agents]"
+        kind = cfg["agents"][name].get("kind")
+        assert kind in ROLE_ARGS, f"agent {name!r}: kind must be one of {sorted(ROLE_ARGS)}, not {kind!r}"
+
+
+def command(agent, role, prompt, report):
+    """The argv, the stdin text, and whether the report arrives on stdout."""
+    kind = agent["kind"]
+    model, effort = agent.get("model", ""), agent.get("effort", "")
+    extra = list(agent.get(f"{role}_args", ROLE_ARGS[kind][role])) + list(agent.get("args", []))
+    if kind == "codex":
+        argv = ["codex", "exec", *extra, "-o", str(report)]
+        if model:
+            argv += ["-m", model]
+        if effort:
+            argv += ["-c", f'model_reasoning_effort="{effort}"']
+        return argv + ["-"], prompt, False
+    if kind == "claude":
+        argv = ["claude", "-p", "--output-format", "text"]
+        if model:
+            argv += ["--model", model]
+        if effort:
+            argv += ["--effort", effort]
+        return argv + extra, prompt, True
+    argv = ["agy"]  # agy
+    if model:
+        argv += ["--model", model]
+    if effort:
+        argv += ["--effort", effort]
+    return argv + extra + ["-p", prompt], None, True
+
+
+def start(agent, role, prompt, report, log, dry):
+    argv, stdin, to_stdout = command(agent, role, prompt, report)
+    shown = [f"<prompt, {len(a)} chars>" if a == prompt else a for a in argv]
+    print(f"  $ {' '.join(shown)}" + ("  < prompt" if stdin else ""), flush=True)
+    if dry:
+        return None
+    err = open(log, "w")
+    out = open(report, "w") if to_stdout else err
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
+                            stdout=out, stderr=err if to_stdout else subprocess.STDOUT, text=True)
+    if stdin:
+        proc.stdin.write(stdin)
+        proc.stdin.close()
+    return proc, report, log
+
+
+def finish(job, name):
+    proc, report, log = job
+    code = proc.wait()
+    assert code == 0, f"{name} exited with {code}; see {log}"
+    text = Path(report).read_text().strip()
+    assert text, f"{name} wrote an empty report; see {log}"
+    return text
+
+
+def tree_state():
+    """Tracked changes and the untracked files, to check that reviewers changed nothing."""
+    return (git("rev-parse", "HEAD"), git("status", "--porcelain", "--untracked-files=no"),
+            git("ls-files", "--others", "--exclude-standard"))
+
+
+def verdict(report):
+    lines = [l.strip().strip("*`") for l in report.splitlines() if l.strip()]
+    m = re.fullmatch(r"VERDICT:\s*(CLEAN|FINDINGS)", lines[-1]) if lines else None
+    return m.group(1) if m else "UNCLEAR"
+
+
+def run(cfg, out, dry):
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    base = cfg["base"]
+    assert branch != base, f"HEAD is on {base}; check out the branch to review"
+    assert git("rev-list", "--count", f"{base}..HEAD") != "0", f"no commits on {branch} beyond {base}"
+    assert not git("status", "--porcelain", "--untracked-files=no"), \
+        "tracked files have uncommitted changes; commit or stash them first"
+
+    if not dry:
+        out.mkdir(parents=True, exist_ok=True)
+    print(f"reviewing {branch} against {base}: {cfg['rounds']} round(s), {cfg['mode']}, "
+          f"reviewers {', '.join(cfg['reviewers'])}, fixer {cfg['fixer']}\nout: {out}", flush=True)
+    focus = f"\nFocus: {cfg['focus']}\n" if cfg["focus"] else ""
+    summary = [f"# agent-review: `{branch}` against `{base}`\n",
+               f"{cfg['mode']}, reviewers {', '.join(cfg['reviewers'])}, fixer {cfg['fixer']}, "
+               f"started at {git('rev-parse', '--short', 'HEAD')}\n"]
+    history = ""
+
+    for rnd in range(1, cfg["rounds"] + 1):
+        print(f"\nround {rnd}", flush=True)
+        before = tree_state()
+        reports = {}
+        if cfg["mode"] == "parallel":
+            jobs = {}
+            for name in cfg["reviewers"]:
+                prompt = REVIEW_PROMPT.format(branch=branch, base=base, focus=focus, history=history, chain="")
+                jobs[name] = start(cfg["agents"][name], "review", prompt,
+                                   out / f"r{rnd}-{name}.md", out / f"r{rnd}-{name}.log", dry)
+            if dry:
+                reports = {n: "VERDICT: FINDINGS" for n in jobs}
+            else:
+                reports = {n: finish(j, n) for n, j in jobs.items()}
+        else:
+            for name in cfg["reviewers"]:
+                chain = "".join(f"\nAn earlier reviewer ({n}) reported this round:\n\n{r}\n" for n, r in reports.items())
+                if chain:
+                    chain += "\nConfirm or dispute their findings where you have evidence, and add what they missed.\n"
+                prompt = REVIEW_PROMPT.format(branch=branch, base=base, focus=focus, history=history, chain=chain)
+                job = start(cfg["agents"][name], "review", prompt,
+                            out / f"r{rnd}-{name}.md", out / f"r{rnd}-{name}.log", dry)
+                reports[name] = "VERDICT: FINDINGS" if dry else finish(job, name)
+        if not dry:
+            assert tree_state() == before, "a reviewer changed the working tree or HEAD; see `git status`"
+
+        verdicts = {n: verdict(r) for n, r in reports.items()}
+        if not dry:
+            print("  verdicts: " + ", ".join(f"{n} {v}" for n, v in verdicts.items()), flush=True)
+        summary.append(f"\n## Round {rnd}\n\nVerdicts: " + ", ".join(f"{n} **{v}**" for n, v in verdicts.items()) + "\n")
+        summary += [f"\n### {n}\n\n{r}\n" for n, r in reports.items()]
+        if all(v == "CLEAN" for v in verdicts.values()):
+            print("  every reviewer says CLEAN; stopping", flush=True)
+            break
+        if cfg["fixer"] == "none":
+            continue
+
+        joined = "\n\n".join(f"## Report from {n}\n\n{r}" for n, r in reports.items())
+        prompt = FIX_PROMPT.format(branch=branch, base=base, round=rnd, reports=joined)
+        fixer = cfg["fixer"]
+        job = start(cfg["agents"][fixer], "fix", prompt, out / f"r{rnd}-fix-{fixer}.md", out / f"r{rnd}-fix-{fixer}.log", dry)
+        if dry:
+            continue
+        response = finish(job, fixer)
+        summary.append(f"\n### Fixer ({fixer})\n\n{response}\n")
+        commit = commit_fixes(before, response, rnd)
+        summary.append(f"\nCommit: {commit or 'none'}\n")
+        print(f"  fixer committed {commit}" if commit else "  fixer changed nothing; stopping", flush=True)
+        if not commit:
+            break
+        history = (f"\nThis is review round {rnd + 1}. In round {rnd} the reviewers reported:\n\n{joined}\n\n"
+                   f"The author responded, then committed {commit}:\n\n{response}\n\n"
+                   f"Check that the fixes are right, that the rejections hold up, and look for anything new. "
+                   f"Do not repeat findings that were rightly rejected.\n")
+
+    if not dry:
+        (out / "summary.md").write_text("".join(summary))
+        print(f"\nsummary: {out / 'summary.md'}")
+
+
+def commit_fixes(before, response, rnd):
+    """Commit the fixer's changes: tracked edits, plus the new files it named that exist and were
+    not there before (so test and build output stays out). Returns the short hash."""
+    _, _, untracked_before = before
+    created = set(git("ls-files", "--others", "--exclude-standard").splitlines()) - set(untracked_before.splitlines())
+    m = re.search(r"^\W*NEW FILES:\s*(.+)$", response, re.M)
+    named = set(m.group(1).replace("`", "").split()) - {"none"} if m else set()
+    new_files = sorted(named & created)
+    left = sorted(created - named)
+    if left:
+        print(f"  left untracked (the fixer did not name them): {' '.join(left[:10])}"
+              + (" ..." if len(left) > 10 else ""), flush=True)
+    if not git("status", "--porcelain", "--untracked-files=no") and not new_files:
+        return None
+    m = re.search(r"^\W*COMMIT:\s*(.+)$", response, re.M)
+    message = m.group(1).strip().strip("`") if m and m.group(1).strip() != "none" else f"Address review round {rnd}"
+    git("add", "-u")
+    if new_files:
+        git("add", "--", *new_files)
+    git("commit", "-m", f"{message}\n\nFrom agent-review round {rnd}.")
+    return git("rev-parse", "--short", "HEAD")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-C", "--repo", type=Path, default=Path("."), metavar="DIR",
+                   help="Git worktree to review (default current directory)")
+    p.add_argument("--base", help="Git ref to diff against (default main)")
+    p.add_argument("--rounds", type=int, help="maximum review rounds (default 2)")
+    p.add_argument("--mode", choices=["parallel", "chain"], help="reviewers independent, or in order")
+    p.add_argument("--reviewers", help="comma-separated agent names, in order, e.g. codex,agy")
+    p.add_argument("--fixer", help="agent name, or none for review only")
+    p.add_argument("--focus", help="extra instructions for the reviewers")
+    p.add_argument("--set", action="append", default=[], metavar="NAME.FIELD=VALUE",
+                   help="override an agent field, e.g. codex.effort=xhigh (repeatable)")
+    p.add_argument("--config", help="an extra TOML config file, applied after the others")
+    p.add_argument("--out", help="output directory (default ~/.cache/agent-review/<repo>/<branch>-<time>)")
+    p.add_argument("--dry-run", action="store_true", help="print the commands only")
+    p.add_argument("--show-config", action="store_true", help="print the merged config and exit")
+    p.add_argument("--init", action="store_true", help=f"write an example config to {USER_CONFIG}")
+    args = p.parse_args()
+
+    if args.init:
+        assert not USER_CONFIG.exists(), f"{USER_CONFIG} exists; edit it instead"
+        USER_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        USER_CONFIG.write_text(EXAMPLE_CONFIG)
+        print(f"wrote {USER_CONFIG}")
+        return
+
+    try:
+        os.chdir(args.repo)
+    except OSError as error:
+        p.error(f"cannot enter {args.repo}: {error.strerror}")
+    top = Path(git("rev-parse", "--show-toplevel"))
+    os.chdir(top)
+    cfg = load_config(args, top)
+    if args.show_config:
+        import json
+        print(json.dumps(cfg, indent=2))
+        return
+
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out = Path(args.out) if args.out else CACHE / top.name / f"{branch.replace('/', '-')}-{stamp}"
+    run(cfg, out.resolve(), args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

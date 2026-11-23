@@ -1,0 +1,210 @@
+# .bashrc
+
+export EDITOR=vim
+export PS1='${debian_chroot:+($debian_chroot)}\W\$ '
+
+# Source global definitions
+if [ -f /etc/bashrc ]; then
+    . /etc/bashrc
+fi
+
+if [ -f /etc/bash_completion ]; then
+    . /etc/bash_completion
+fi
+
+# https://superuser.com/questions/39751/add-directory-to-path-if-its-not-already-there
+pathadd() {
+    if [ -d "$1" ] && [[ ":$PATH:" != *":$1:"* ]]; then
+        PATH="${PATH:+"$PATH:"}$1"
+    fi
+}
+
+pathadd "$HOME/bin"
+pathadd "$HOME/.local/bin"
+pathadd "/usr/local/bin"
+pathadd "/usr/local/sbin"
+
+
+# open vim with no .vimrc
+export vi="vi -u NONE"
+
+# Profile a python script
+alias prof='python -m cProfile -s time'
+alias pdb='python -m ipdb -c continue'
+
+REPODIR="${HOME}/repos"
+
+export ISCE3_PREFIX=$REPODIR/isce3/install
+# isce3_add() {
+# export PATH=$PATH:$ISCE3_PREFIX/bin
+# export PYTHONPATH=$PYTHONPATH:$ISCE3_PREFIX/packages
+# export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ISCE3_PREFIX/lib
+# export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ISCE3_PREFIX/lib64
+# }
+# couldnt get this to work...
+# https://github.com/isce3-testing/isce3-ci-sandbox/blob/e532b5cbeb4e63a89d345c011342462b56e69b2a/.github/workflows/build-and-run.yml#L111
+
+# NOTE: this will make terminal plots fail
+# https://stackoverflow.com/questions/2801882/generating-a-png-with-matplotlib-when-display-is-undefined?lq=1
+# BUT this really speeds up import time for some reason...
+# https://github.com/matplotlib/matplotlib/blob/6a7be8250ec2068084f5f7a009aba668253e4049/src/_c_internal_utils.c#L13
+# display_is_valid gets called and the XOpenDisplay call is very slow with DISPLAY=localhost:10.0
+# so either setting DISPLAY='' or this works
+export MPLBACKEND="agg"
+
+# https://github.com/insarlab/MintPy/blob/6fffa3b3940362c3120499f9956c9a52c7ca7fdb/docs/installation.md?plain=1#L228
+export HDF5_USE_FILE_LOCKING=FALSE
+
+
+# since we can only add 1 type of stack processor to the "$PATH" at a time...time...
+isce_add_strip() {
+    export PATH=$PATH:${REPODIR}/isce2/contrib/stack/stripmapStack/
+}
+isce_add_tops() {
+    export PATH=$PATH:${REPODIR}/isce2/contrib/stack/topsStack/
+}
+
+# Git shortcuts
+alias st='git status'
+alias ci='git commit'
+alias gpsh='git push'
+alias ga='git add'
+alias gd='git diff'
+alias gb='git branch'
+alias gpl='git pull'
+alias gk='git checkout'
+
+alias ..='cd ..'
+alias cl='clear'
+alias ls='ls --color'
+alias lsm='ls -laxo | more'
+alias lsh='ls -lh'
+alias lss='ls -lhS'
+alias lst='ls -lht'
+lsth() { lst $1 | head; }
+alias rm='rm -i'
+
+alias repo="cd ${REPODIR}"
+alias learn='cd ~/Documents/Learning'
+
+
+# REPOS="dolphin insar apertools sardem sentineleof blobsar trodi troposim spurs uavsar COMPASS s1-reader tophu"
+# REPOS="dolphin sweets apertools COMPASS s1-reader tophu sardem sentineleof trodi"
+REPOS="dolphin sweets apertools sardem snaphu-py sentineleof disp-s1 opera-utils burst_db orca COMPASS s1-reader tophu "
+gplsar() {
+    repo
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && gpl &&cd $REPODIR
+    done
+}
+installsar() {
+    repo
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && pip install --no-deps -e .
+        cd $REPODIR
+    done
+}
+stsar() {
+    repo
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && echo $D && st && cd $REPODIR
+    done
+}
+
+gpshsar() {
+    repo
+    for D in $REPOS; do
+        cd "${REPODIR}/${D}" && git push && cd $REPODIR
+    done
+}
+
+gitgrephist() {
+    git grep "$1" $(git rev-list --all)
+}
+
+
+export BASH_SILENCE_DEPRECATION_WARNING=1
+
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=1
+
+# Shrink a pdf with compression
+# usage: shrinkpdf input.pdf output.pdf
+shrinkpdf() {
+  gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/default \
+  -dNOPAUSE -dQUIET -dBATCH -dDetectDuplicateImages \
+  -dCompressFonts=true -r150 -sOutputFile="$2" "$1"
+}
+
+
+mdxunw() {
+    # mdxunw <image> <cols>
+    #  -rtlr  =  Size of trailer (in bytes) at the end of each line
+    xsize=$(gdalinfo -json $1 | jq .size[0])
+    linebytes=$(( 4 * ${xsize} ))
+    mdx "$1" -cols ${xsize} -wrap 9.42 -rhdr $linebytes -CW -unw -r4 -cmap cmy
+}
+
+xsize() {
+    gdalinfo -json $1 | jq .size[0]
+}
+
+ysize() {
+    gdalinfo -json $1 | jq .size[1]
+}
+
+shape () {
+    # Merge the count,rows,cols by removing [, ], and combining newlines with ,
+    for f in $@; do
+        echo $f
+        shape3=$(DISPLAY='' rio info $f | jq -c .count,.shape | tr -d '\[\]' | paste -s -d,)
+        echo $shape3
+   done
+}
+
+
+
+# >>> conda initialize >>>
+# !! Contents within this block are managed by 'conda init' !!
+__conda_setup="$('/home/scott/miniforge3/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    eval "$__conda_setup"
+else
+    if [ -f "/home/scott/miniforge3/etc/profile.d/conda.sh" ]; then
+        . "/home/scott/miniforge3/etc/profile.d/conda.sh"
+    else
+        export PATH="/home/scott/miniforge3/bin:$PATH"
+    fi
+fi
+unset __conda_setup
+
+if [ -f "/home/scott/miniforge3/etc/profile.d/mamba.sh" ]; then
+    . "/home/scott/miniforge3/etc/profile.d/mamba.sh"
+fi
+# <<< conda initialize <<<
+conda activate mapping-311
+
+# https://asdf-vm.com/guide/getting-started.html
+. "$HOME/.asdf/asdf.sh"
+. "$HOME/.asdf/completions/asdf.bash"
+
+# Jekyll stuff
+alias js="bundle exec jekyll serve"
+
+# >>> juliaup initialize >>>
+
+# !! Contents within this block are managed by juliaup !!
+
+case ":$PATH:" in
+    *:/home/scott/.juliaup/bin:*)
+        ;;
+
+    *)
+        export PATH=/home/scott/.juliaup/bin${PATH:+:${PATH}}
+        ;;
+esac
+
+# <<< juliaup initialize <<<
+
+# Rustup initialize
+. "$HOME/.cargo/env"

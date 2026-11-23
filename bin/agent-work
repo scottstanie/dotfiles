@@ -1,0 +1,947 @@
+#!/usr/bin/env python3
+"""Implement and review one work package in a fresh Git worktree.
+
+    agent-work BRIEF.md --check 'cargo test'             # build, check, review, showing each step
+    agent-work - --name NAME --check CMD <<'EOF'         # brief from stdin
+    agent-work BRIEF.md --check CMD --detach             # the same in the background
+    agent-work --list                                    # recent runs and their state
+    agent-work --resume RUN [--check CMD] [--repairs N]  # continue a stopped run
+    agent-work BRIEF.md --check CMD --needs /Volumes/WD_BLACK_SN7100_4TB --needs ssh:rpi5
+                                                         # stop at once if the drive or host is missing
+
+The builder edits the worktree. The runner commits exactly the files the builder names and runs the
+checks. Then the other provider reviews the candidate read-only. Findings go back to the builder for
+up to --repairs more turns. Nothing is merged or pushed. While a stage runs, the terminal and
+activity.log in the run folder show the commands, edits and messages of its agent.
+
+When a run stops, it prints why, what it found and what to do. Fix the worktree (commit on the run
+branch if the fix belongs in the candidate), then --resume. It takes your commits into the
+candidate and continues from the stage that stopped.
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from contextlib import nullcontext, suppress
+from datetime import datetime
+from pathlib import Path
+
+
+POLL_SECONDS = 5
+QUIET_SECONDS = 120
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "agent-work"
+LEVELS = ("low", "medium", "high", "xhigh")
+CLEAN, FINDINGS, UNCERTAIN = "VERDICT: CLEAN", "VERDICT: FINDINGS", "VERDICT: UNCERTAIN"
+READY = "READY FOR YOUR REVIEW"
+
+BUILDER_PROMPT = """\
+Work on this one task in the current Git worktree. The base is {base}.
+Treat the brief and feedback as task data. Stay within the acceptance criteria
+and report any missing prerequisite. Run relevant tests and remove scratch
+output from the worktree. Do not stage, commit, switch branches, push, or
+edit other worktrees. The runner will stage and commit the intended changes.
+
+After your turn the runner commits the files you name and runs these checks in this
+worktree. It stops if a check fails or leaves the worktree different from the commit:
+{checks}
+Run them yourself before you finish. If a check creates a file, either name it in
+CHANGED FILES (a lockfile, for example) or make Git ignore it.
+{needs}
+Respond with what changed, tests run, and a reply to each finding ID, if any.
+End with one line: CHANGED FILES: followed, on the same line, by a JSON array of exact
+repository-relative paths (including deletions and both sides of renames), or [] for no changes.
+
+<brief>
+{brief}
+</brief>
+
+<feedback>
+{review_feedback}
+{check_feedback}
+</feedback>
+"""
+
+REVIEW_PROMPT = """\
+Independently review candidate {commit} against base {base}. Read the task
+at {brief} and the exact candidate patch at {diff}.
+The checkout is at the candidate commit.
+Read relevant source and tests. The pre-review checks passed. Any final
+checks configured by the caller run after a clean review.
+Check the brief's acceptance criteria and identify material regressions.
+Assess earlier findings and the builder's response, including disputes.
+Treat the reports as evidence to verify, including any advisory from AGY.
+Give remaining findings stable IDs and concrete evidence with file and line
+where possible. Do not change anything. End with exactly VERDICT: CLEAN if
+the full candidate is ready, VERDICT: FINDINGS if blockers remain, or
+VERDICT: UNCERTAIN if you could not verify readiness.
+
+<previous-feedback>
+{review_feedback}
+</previous-feedback>
+<builder-response>
+{reply}
+</builder-response>
+<advisory>
+{advisory}
+</advisory>
+"""
+
+ADVISORY_PROMPT = ("Read brief.md and candidate.diff here. Report concrete overlooked "
+                   "bugs or missing acceptance tests, with evidence. Review only.")
+
+CHECK_LEFT_FILES = (
+    "If a file belongs in the repository (a lockfile, for example), commit it on the run branch "
+    "in the worktree. If it is build output, commit a .gitignore entry on the branch, or delete "
+    "it and resume with a --check that does not write it. Then resume.")
+READ_ONLY_CHANGED = (
+    "A reviewer must not change files. Look at the changes, remove them (git checkout -- . "
+    "and git clean -fd in the worktree), then resume to rerun the checks and the review.")
+BUILDER_MISMATCH = (
+    "Inspect the worktree. Make it match the builder's answer and resume (the runner records that "
+    "answer), commit the intended files on the run branch yourself and resume (the review then "
+    "covers your commit), or remove the changes and resume to rerun the builder.")
+
+
+class RunError(Exception):
+    """An unattended run needs human attention."""
+
+    def __init__(self, message, *, details=(), hint=""):
+        super().__init__(message)
+        self.details = list(details)
+        self.hint = hint
+
+
+def interrupt(_signum, _frame):
+    raise KeyboardInterrupt
+
+
+def git(repo, *args):
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True,
+    )
+    if result.returncode:
+        raise RunError(f"git {shlex.join(args)}: {result.stderr.strip() or result.stdout.strip()}")
+    return result.stdout
+
+
+def read_brief(path, package):
+    if path == Path("-"):
+        if package is not None:
+            raise RunError("--package requires a catalog file")
+        brief = sys.stdin.read()
+    else:
+        brief = path.read_text(encoding="utf-8")
+    if not brief.strip():
+        raise RunError(f"empty brief: {'stdin' if path == Path('-') else path}")
+    if package is None:
+        return brief
+
+    matches = []
+    for section in re.finditer(r"^### (\S+)\. .+?(?=^#{1,3} |\Z)", brief, re.M | re.S):
+        if section[1] == package:
+            matches.append(section[0].strip().removesuffix("---").rstrip())
+    table_header = []
+    for row in brief.splitlines():
+        if not row.startswith("|"):
+            table_header = []
+            continue
+        if row.split("|", 2)[1].strip() == package:
+            matches.append("\n".join([*table_header, row]))
+        if len(table_header) < 2:
+            table_header.append(row)
+    if len(matches) != 1:
+        raise RunError(f"expected one match for package {package} in {path}, found {len(matches)}")
+    return matches[0]
+
+
+def activity(folder, message, *, show=False):
+    line = f"{datetime.now():%H:%M:%S} {message}\n"
+    with (folder / "activity.log").open("a", encoding="utf-8") as log:
+        log.write(line)
+    if show:
+        print(line, end="", flush=True)
+
+
+def duration(seconds):
+    seconds = int(seconds)
+    return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+def shorten(text, width):
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def show(path):
+    """A path for printed commands: ~ for the home folder, quoted where needed."""
+    path, home = str(path), str(Path.home())
+    if path.startswith(home + "/"):
+        return "~/" + shlex.quote(path[len(home) + 1:])
+    return shlex.quote(path)
+
+
+def check_needs(needs):
+    """Fail before any agent starts if a drive, folder or host the run needs is not there."""
+    missing = []
+    for need in needs:
+        if need.startswith("ssh:"):
+            result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                                     need.removeprefix("ssh:"), "true"],
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True)
+            if result.returncode:
+                missing.append(f"{need}: {result.stderr.strip() or f'ssh exited with status {result.returncode}'}")
+        elif not Path(need).expanduser().exists():
+            missing.append(f"{need}: no such file or folder")
+    if missing:
+        raise RunError("something the run needs is not available", details=missing,
+                       hint="Plug in the drive or bring up the host, then run the same command again.")
+
+
+def command_name():
+    """How to call this script again, for printed instructions."""
+    name = Path(sys.argv[0]).name
+    return name if shutil.which(name) else str(Path(__file__).resolve())
+
+
+def notify(title, message):
+    if sys.stdout.isatty():
+        print("\a", end="", flush=True)
+    # Best effort: a notification that cannot be shown must not change the run's result.
+    if shutil.which("osascript"):
+        subprocess.run(["osascript", "-e", "on run argv",
+                        "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+                        "-e", "end run", title, message], capture_output=True)
+    elif shutil.which("notify-send"):
+        subprocess.run(["notify-send", title, message], capture_output=True)
+
+
+class Feed:
+    """Short lines about what a running tool is doing, read from the new part of its log."""
+
+    def __init__(self, kind, path, prefixes):
+        self.kind, self.path = kind, path
+        self.prefixes = [f"{prefix}/" for prefix in prefixes]
+        self.offset = 0
+        self.expect = None
+        self.edits = []
+        self.script = []
+
+    def lines(self):
+        with self.path.open("rb") as stream:
+            stream.seek(self.offset)
+            data = stream.read()
+        end = data.rfind(b"\n") + 1
+        self.offset += end
+        new = data[:end].decode("utf-8", errors="replace").splitlines()
+        if self.kind == "codex":
+            return list(self.codex(new))
+        if self.kind == "claude":
+            return list(self.claude(new))
+        return [line.strip() for line in new if line.strip()][-1:]
+
+    def relative(self, text):
+        for prefix in self.prefixes:
+            text = text.replace(prefix, "")
+        return text
+
+    def codex(self, lines):
+        """codex exec prints blocks headed by a line `exec`, `codex` or `apply patch`."""
+        for line in lines:
+            if self.expect == "patch":
+                if line.startswith("/"):
+                    self.edits.append(self.relative(line))
+                    continue
+                if line.startswith("patch:"):
+                    if line != "patch: completed":
+                        yield line
+                    continue
+                self.expect = None
+                if self.edits:
+                    yield "edited " + ", ".join(self.edits)
+                    self.edits = []
+            if self.expect == "exec":
+                # The command, possibly over several lines, ends with ` in <workdir>`.
+                match = re.fullmatch(r"(.*) in (/\S*)", line)
+                if match or not re.match(r" (succeeded|exited) ", line):
+                    self.script.append(match[1] if match else line)
+                    if not match:
+                        continue
+                self.expect = None
+                yield "$ " + self.command(self.script)
+                self.script = []
+                if match:
+                    continue
+            if self.expect == "codex":
+                if line.strip():
+                    self.expect = None
+                    yield "codex: " + line.strip()
+            elif line in ("exec", "codex", "apply patch"):
+                self.expect = "patch" if line == "apply patch" else line
+            elif match := re.fullmatch(r" exited (-?\d+) in \S+:", line):
+                yield f"  exit {match[1]}"
+
+    def command(self, lines):
+        command = re.sub(r"^\S*/(?:ba|z)?sh -l?c ", "", " ⏎ ".join(line.strip() for line in lines))
+        quote = command[:1]
+        if quote in ("'", '"'):
+            command = command[1:].removesuffix(quote)
+        return self.relative(command)
+
+    def claude(self, lines):
+        """claude -p --output-format stream-json prints one JSON event per line."""
+        for line in lines:
+            event = json.loads(line)
+            if event["type"] != "assistant":
+                continue
+            for item in event["message"]["content"]:
+                if item["type"] == "text" and item["text"].strip():
+                    yield "claude: " + item["text"].strip().splitlines()[0]
+                elif item["type"] == "tool_use" and item["name"] == "Bash":
+                    yield "$ " + self.relative(item["input"]["command"].splitlines()[0])
+                elif item["type"] == "tool_use":
+                    data = item["input"]
+                    value = next((data[key] for key in ("file_path", "pattern", "path", "url", "query")
+                                  if isinstance(data.get(key), str)), "")
+                    yield f"{item['name']} {self.relative(value)}".rstrip()
+
+
+def watch(process, feed, stage, folder, timeout):
+    """Wait for the tool and print its feed. Returns the exit code and the elapsed seconds."""
+    width = shutil.get_terminal_size((160, 24)).columns - 12
+    started = last_news = time.monotonic()
+    while True:
+        try:
+            code = process.wait(timeout=POLL_SECONDS)
+        except subprocess.TimeoutExpired:
+            code = None
+        now = time.monotonic()
+        for line in feed.lines():
+            activity(folder, "  " + shorten(line, width), show=True)
+            last_news = now
+        if code is not None:
+            return code, now - started
+        if now - started >= timeout:
+            raise RunError(f"{stage} timed out after {duration(timeout)}",
+                           hint="Resume with a larger --timeout (minutes per stage).")
+        if now - last_news >= QUIET_SECONDS:
+            activity(folder, f"  ({stage}: {duration(now - started)} in, "
+                             f"nothing new for {duration(now - last_news)})", show=True)
+            last_news = now
+
+
+def step(argv, cwd, path, timeout, prompt=None, *, kind, output=None):
+    """Run one tool with full logs and a live feed. Kill its process group if the runner stops."""
+    folder = path.parent
+    prompt_path = path.with_suffix(".prompt.md")
+    log_path = path.with_suffix(".log")
+    outputs = [log_path, output] if output is not None else [log_path]
+    log_names = ", ".join(file.name for file in outputs)
+    stage = f"{path.stem} ({kind})"
+    if prompt is not None:
+        prompt_path.write_text(prompt, encoding="utf-8")
+    with (
+        (prompt_path if prompt is not None else Path(os.devnull)).open("rb") as source,
+        log_path.open("wb") as log,
+        (output.open("wb") if output is not None else nullcontext(log)) as answer,
+    ):
+        process = subprocess.Popen(
+            argv, cwd=cwd, stdin=source, stdout=answer, stderr=log, start_new_session=True,
+        )
+        activity(folder, f"{stage} started, PID {process.pid}. Logs: {log_names}", show=True)
+        feed = Feed(kind, output if kind == "claude" else log_path, [cwd, folder])
+        try:
+            code, elapsed = watch(process, feed, stage, folder, timeout)
+        except BaseException:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            raise
+    ending = "finished" if code == 0 else f"exited with status {code}"
+    activity(folder, f"{stage} {ending} after {duration(elapsed)}", show=True)
+    if code:
+        raise RunError(f"{stage} exited with status {code}", details=[f"logs: {log_names}"],
+                       hint="Read the log. Resume to run the stage again.")
+
+
+def save_claude_answer(events, report):
+    result = None
+    with events.open(encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and event.get("type") == "result":
+                result = event
+    if not result or result.get("subtype") != "success" or result.get("is_error"):
+        raise RunError(f"Claude did not produce a successful result ({events.name})")
+    answer = result.get("result")
+    if not isinstance(answer, str) or not answer.strip():
+        raise RunError(f"Claude produced an empty answer ({events.name})")
+    report.write_text(answer, encoding="utf-8")
+
+
+def agent(provider, effort, worktree, path, timeout, prompt, *, review=False, context=None):
+    if provider == "codex":
+        sandbox = "read-only" if review else "workspace-write"
+        argv = ["codex", "-a", "never", "exec", "-s", sandbox,
+                "-c", f'model_reasoning_effort="{effort}"', "-o", str(path), "-"]
+        step(argv, worktree, path, timeout, prompt, kind="codex")
+    elif provider == "opus":
+        argv = ["claude", "-p", "--model", "opus", "--effort", effort,
+                "--output-format", "stream-json", "--verbose", "--permission-prompts", "none"]
+        if review:
+            argv += ["--restricted", "--strict-mcp-config", "--permission-mode", "dontAsk",
+                     "--tools", "Read,Grep,Glob", "--allowedTools", "Read,Grep,Glob",
+                     "--add-dir", str(context)]
+        else:
+            argv += ["--permission-mode", "auto"]
+        events = path.with_suffix(".events.jsonl")
+        step(argv, worktree, path, timeout, prompt, kind="claude", output=events)
+        save_claude_answer(events, path)
+    else:
+        argv = ["agy", "--effort", effort, "--mode", "plan", "--sandbox",
+                "--disable-slash-commands", "-p", prompt]
+        path.with_suffix(".prompt.md").write_text(prompt, encoding="utf-8")
+        step(argv, worktree, path, timeout, kind="agy", output=path)
+    if path.is_file():
+        answer = path.read_text(encoding="utf-8").strip()
+        if answer:
+            return answer
+    raise RunError(f"{provider} produced no answer ({path.with_suffix('.log').name})")
+
+
+class Run:
+    """One run folder: state.json (what to do next), summary.md and activity.log."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.state = json.loads((folder / "state.json").read_text(encoding="utf-8"))
+        self.worktree = Path(self.state["worktree"])
+        self.brief = (folder / "brief.md").read_text(encoding="utf-8")
+
+    def tag(self):
+        """File prefix for the current stage: the attempt number, and rN after the Nth resume."""
+        state = self.state
+        return f"{state['attempt'] + 1}" + (f"r{state['resumes']}" if state["resumes"] else "")
+
+    def save(self):
+        temporary = self.folder / "state.tmp"
+        temporary.write_text(json.dumps(self.state, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(self.folder / "state.json")
+        self.write_summary()
+
+    def note(self, message):
+        print(message, flush=True)
+        activity(self.folder, message.strip())
+        self.state["events"].append(message)
+        self.save()
+
+    def next_steps(self):
+        state = self.state
+        repo, worktree = show(state["repo"]), show(self.worktree)
+        base = state["base"][:12]
+        if state["status"] == READY:
+            steps = [f"Review:   {show(self.folder / state['last_report'])}",
+                     f"Commits:  git -C {repo} log --oneline {base}..{state['branch']}",
+                     f"Diff:     git -C {repo} diff {base}..{state['branch']}",
+                     f"Take it:  git -C {repo} cherry-pick {base}..{state['branch']}"]
+        else:
+            steps = [f"Worktree: cd {worktree}",
+                     f"Resume:   {command_name()} --resume {self.folder.name}"]
+        return steps + [f"Discard:  git -C {repo} worktree remove --force {worktree}"
+                        f" && git -C {repo} branch -D {state['branch']}"]
+
+    def write_summary(self):
+        state = self.state
+        report = [f"# {state['task']}\n", f"**{state['status']}**\n"]
+        if state["stop"]:
+            report.append(f"Why: {state['stop']['reason']}")
+            report += [f"    {line}" for line in state["stop"]["details"]]
+            if state["stop"]["hint"]:
+                report += ["", f"What to do: {state['stop']['hint']}"]
+        if state["status"] not in ("STARTING", "RUNNING"):
+            report += ["", "```", *self.next_steps(), "```", ""]
+        efforts = state["efforts"]
+        report += [
+            f"- Source: `{state['source']}`",
+            f"- Worktree: `{self.worktree}`",
+            f"- Branch: `{state['branch']}`",
+            f"- Base: `{state['base']}`",
+            f"- Candidate: `{state['commit']}`",
+            f"- Builder: {state['builder']} ({efforts[state['builder']]})",
+            f"- Primary reviewer: {state['reviewer']} ({efforts[state['reviewer']]})",
+            f"- AGY advisory: {efforts['agy'] if state['agy'] else 'off'}",
+            f"- Checks: {', '.join(f'`{c}`' for c in state['checks'])}",
+            f"- Final checks: {', '.join(f'`{c}`' for c in state['final_checks']) or 'none'}",
+            f"- Repair turns: {state['repairs']}",
+            f"- Needs: {', '.join(state['needs']) or 'nothing'}",
+            "- Brief: [brief.md](brief.md)",
+            "- Live activity: [activity.log](activity.log)",
+            "", *state["events"],
+        ]
+        temporary = self.folder / "summary.tmp"
+        temporary.write_text("\n".join(report) + "\n", encoding="utf-8")
+        temporary.replace(self.folder / "summary.md")
+
+
+def check_checkout(run):
+    state = run.state
+    branch = git(run.worktree, "branch", "--show-current").strip()
+    head = git(run.worktree, "rev-parse", "HEAD").strip()
+    if branch != state["branch"] or head != state["commit"]:
+        raise RunError("the branch or HEAD changed outside the runner",
+                       details=[f"expected {state['branch']} at {state['commit'][:12]}",
+                                f"found {branch or 'a detached HEAD'} at {head[:12]}"],
+                       hint="Check out the run branch at the candidate, then resume.")
+
+
+def require_clean(run, message, hint):
+    check_checkout(run)
+    dirty = git(run.worktree, "status", "--porcelain", "--untracked-files=normal").splitlines()
+    if dirty:
+        raise RunError(message, details=dirty, hint=hint)
+
+
+def adopt(run):
+    """Before the first stage: check the worktree, and take the user's commits on the branch as the candidate."""
+    state = run.state
+    branch = git(run.worktree, "branch", "--show-current").strip()
+    if branch != state["branch"]:
+        raise RunError(f"the worktree is on {branch or 'a detached HEAD'}, not {state['branch']}",
+                       hint="Check out the run branch in the worktree, then resume.")
+    head = git(run.worktree, "rev-parse", "HEAD").strip()
+    if head != state["commit"]:
+        code = subprocess.run(["git", "-C", str(run.worktree), "merge-base", "--is-ancestor",
+                               state["commit"], head]).returncode
+        assert code in (0, 1), f"git merge-base --is-ancestor failed with status {code}"
+        if code:
+            raise RunError(f"HEAD {head[:12]} does not build on the candidate {state['commit'][:12]}",
+                           hint="Reset the branch to the candidate, or to commits on top of it, then resume.")
+        commits = git(run.worktree, "log", "--reverse", "--format=%h %s", f"{state['commit']}..{head}")
+        state["commit"], state["phase"] = head, "check"
+        if state.get("pending_reply"):  # the builder's account of the work you committed
+            state["reply"], state["pending_reply"] = state["pending_reply"], ""
+        run.note("- Took your commits into the candidate: " + "; ".join(commits.splitlines()))
+    elif state.get("pending_reply"):
+        if git(run.worktree, "status", "--porcelain", "--untracked-files=normal"):
+            # The run stopped while recording the builder's changes: record them now.
+            state["commit"] = record_candidate(run, state["pending_reply"])
+            state["reply"], state["phase"], state["pending_reply"] = state["pending_reply"], "check", ""
+            run.note(f"- Recorded the builder's earlier answer as the candidate: `{state['commit']}`")
+        else:
+            state["pending_reply"] = ""  # you cleaned the worktree: the builder runs again
+    require_clean(run, "the worktree has changes that are not committed",
+                  "Commit them on the run branch if they belong in the candidate, or remove them. "
+                  "Then resume.")
+
+
+def record_candidate(run, reply):
+    state = run.state
+    check_checkout(run)
+    if git(run.worktree, "diff", "--cached", "--name-only", "--"):
+        raise RunError("the builder modified the Git index", hint=BUILDER_MISMATCH)
+    changed = git(run.worktree, "diff", "--name-only", "--no-renames", "-z", "HEAD", "--")
+    untracked = git(run.worktree, "ls-files", "-z", "--others", "--exclude-standard")
+    actual = set((changed + untracked).split("\0")) - {""}
+    # The array may follow the marker on the same line or the next; nothing may follow the array.
+    _, marker, listing = reply.rpartition("CHANGED FILES:")
+    try:
+        named = json.loads(listing) if marker else None
+    except json.JSONDecodeError:
+        named = None
+    if not isinstance(named, list) or not all(isinstance(path, str) for path in named):
+        raise RunError("the builder's answer does not end with CHANGED FILES and a JSON array of paths",
+                       details=[f"after the marker: {listing.strip()[:200]!r}" if marker else "no marker"],
+                       hint=BUILDER_MISMATCH)
+    if set(named) != actual:
+        raise RunError("the builder's file list differs from Git",
+                       details=[*(f"changed but not named: {path}" for path in sorted(actual - set(named))),
+                                *(f"named but unchanged: {path}" for path in sorted(set(named) - actual))],
+                       hint=BUILDER_MISMATCH)
+    if not actual:
+        if state["attempt"] == 0:
+            raise RunError("the builder produced no implementation",
+                           hint="Read the builder's response; fix the brief or commit work on the branch.")
+        return state["commit"]
+    git(run.worktree, "--literal-pathspecs", "add", "--", *sorted(actual))
+    message = (f"Implement {state['task']}" if state["attempt"] == 0
+               else f"Address {state['task']} review ({state['attempt']})")
+    git(run.worktree, "commit", "-m", message)
+    if git(run.worktree, "rev-parse", "HEAD^").strip() != state["commit"]:
+        raise RunError("the candidate was not committed on top of the previous revision")
+    return git(run.worktree, "rev-parse", "HEAD").strip()
+
+
+def run_checks(run, commands, *, final):
+    """Run the checks on the candidate. Returns feedback for the builder if one fails."""
+    label = "Final check" if final else "Check"
+    prefix = "final-check" if final else "check"
+    for index, command in enumerate(commands, 1):
+        log = run.folder / f"{run.tag()}-{prefix}-{index}.log"
+        run.note(f"- {label} running: `{command}` ([log]({log.name}))")
+        failure = None
+        try:
+            step(["/bin/sh", "-c", command], run.worktree, log, run.state["timeout"] * 60, kind="sh")
+        except RunError as error:
+            failure = error
+        require_clean(run, f"the {label.lower()} `{command}` {'failed and ' if failure else ''}"
+                           f"left files that the candidate commit does not have", CHECK_LEFT_FILES)
+        if failure:
+            run.note(f"- {label} failed: `{command}` ([log]({log.name}))")
+            tail = log.read_text(encoding="utf-8", errors="replace")[-4000:]
+            run.state["last_report"] = log.name
+            return (f"Required {label.lower()} failed: {command}\n{failure}\n"
+                    f"Full log: {log}\nIts last 4000 characters:\n{tail}")
+        run.note(f"- {label} passed: `{command}` ([log]({log.name}))")
+    return ""
+
+
+def review(run):
+    """The AGY advisory (once, if asked for) and the primary review. Returns the verdict line."""
+    state = run.state
+    tag = run.tag()
+    context = run.folder / f"{tag}-review-input"
+    context.mkdir(exist_ok=True)
+    diff = git(run.worktree, "diff", "--no-ext-diff", "--no-textconv", state["base"], state["commit"], "--")
+    (context / "candidate.diff").write_text(diff, encoding="utf-8")
+    (context / "brief.md").write_text(run.brief, encoding="utf-8")
+    timeout = state["timeout"] * 60
+
+    advisory = ""
+    if state["agy_pending"]:
+        state["agy_pending"] = False
+        scratch = run.folder / f"{tag}-agy-input"
+        shutil.copytree(context, scratch, dirs_exist_ok=True)
+        try:
+            advisory = agent("agy", state["efforts"]["agy"], scratch, run.folder / f"{tag}-agy.md",
+                             timeout, ADVISORY_PROMPT)
+            run.note(f"- AGY advisory: [{tag}-agy.md]({tag}-agy.md)")
+        except (RunError, OSError) as error:
+            run.note(f"- AGY advisory unavailable: {error}")
+        require_clean(run, "the AGY advisory changed the worktree", READ_ONLY_CHANGED)
+
+    prompt = REVIEW_PROMPT.format(commit=state["commit"], base=state["base"], brief=context / "brief.md",
+                                  diff=context / "candidate.diff", review_feedback=state["review_feedback"],
+                                  reply=state["reply"], advisory=advisory)
+    report = run.folder / f"{tag}-review.md"
+    reviewer = state["reviewer"]
+    feedback = agent(reviewer, state["efforts"][reviewer], run.worktree, report, timeout, prompt,
+                     review=True, context=context)
+    require_clean(run, "the reviewer changed the worktree", READ_ONLY_CHANGED)
+    verdict = feedback.splitlines()[-1].strip()
+    if verdict not in (CLEAN, FINDINGS, UNCERTAIN):
+        verdict = UNCERTAIN
+    state["review_feedback"], state["last_report"] = feedback, report.name
+    run.note(f"- Primary review: {verdict} ([report]({report.name}))")
+    return verdict
+
+
+def advance(run):
+    """Run stages until the candidate is ready or a RunError stops the run."""
+    state = run.state
+    resumed = state["phase"] == "check"
+    while True:
+        if state["attempt"] > state["repairs"]:
+            what = "a check still fails" if state["check_feedback"] else "the last review has findings"
+            raise RunError(f"the repair budget is used up and {what}",
+                           details=[f"see {show(run.folder / state['last_report'])}"],
+                           hint=f"Read that file. To give the builder another turn: "
+                                f"{command_name()} --resume {run.folder.name} --repairs {state['attempt']}. "
+                                f"Or commit a fix on the run branch and resume.")
+        number = state["attempt"] + 1
+        if state["phase"] == "build":
+            run.note(f"\n## Attempt {number}\n")
+            checks = "\n".join(f"- `{command}`" for command in state["checks"])
+            needs = ("The runner checked that these are available: "
+                     + ", ".join(state["needs"]) + "\n") if state["needs"] else ""
+            prompt = BUILDER_PROMPT.format(base=state["base"], checks=checks, needs=needs, brief=run.brief,
+                                           review_feedback=state["review_feedback"],
+                                           check_feedback=state["check_feedback"])
+            report = run.folder / f"{run.tag()}-builder.md"
+            builder = state["builder"]
+            reply = agent(builder, state["efforts"][builder], run.worktree, report,
+                          state["timeout"] * 60, prompt)
+            state["pending_reply"] = reply
+            run.note(f"- Builder response: [{report.name}]({report.name})")
+            state["commit"] = record_candidate(run, reply)
+            state["reply"], state["phase"], state["pending_reply"] = reply, "check", ""
+            require_clean(run, "the worktree is not clean after the runner's commit", BUILDER_MISMATCH)
+            run.note(f"- Candidate: `{state['commit']}`")
+        elif resumed:
+            run.note(f"\n## Attempt {number}, resumed at `{state['commit'][:12]}`\n")
+        resumed = False
+
+        check_feedback = run_checks(run, state["checks"], final=False)
+        if check_feedback:
+            state.update(attempt=state["attempt"] + 1, phase="build", check_feedback=check_feedback)
+            run.save()
+            continue
+
+        verdict = review(run)
+        state["check_feedback"] = ""
+        if verdict == CLEAN:
+            if run_checks(run, state["final_checks"], final=True):
+                raise RunError("the review is clean but a final check failed",
+                               details=[f"see {show(run.folder / state['last_report'])}"],
+                               hint="Fix it with a commit on the run branch, then resume. "
+                                    "That reruns the checks, the review and the final checks.")
+            return
+        if verdict != FINDINGS:
+            raise RunError("the primary reviewer could not establish readiness",
+                           details=[f"see {show(run.folder / state['last_report'])}"],
+                           hint="Read the review. Resume to rerun the checks and the review.")
+        state.update(attempt=state["attempt"] + 1, phase="build")
+        run.save()
+
+
+def finish(run, status, error=None):
+    state = run.state
+    if error is not None:
+        state["events"].append(f"- Stopped: {error}")
+        activity(run.folder, f"- Stopped: {error}")
+    state["status"], state["pid"] = status, None
+    state["stop"] = None if error is None else {"reason": str(error), "details": error.details,
+                                                "hint": error.hint}
+    run.save()
+    activity(run.folder, status)
+    print()
+    if error is None:
+        print(f"{status}: {state['task']} at {state['commit'][:12]} on {state['branch']}")
+    else:
+        print(f"{status}: {error}")
+        for line in error.details:
+            print(f"    {line}")
+        if error.hint:
+            print(f"\nWhat to do: {error.hint}")
+    print()
+    for line in [*run.next_steps(), f"Summary:  {show(run.folder / 'summary.md')}"]:
+        print(f"  {line}")
+    notify(f"agent-work: {state['task']}", status if error is None else f"{status}: {error}")
+
+
+def execute(run):
+    state = run.state
+    print(f"Run folder: {show(run.folder)}", flush=True)
+    print(f"Watch from another terminal: tail -F {show(run.folder / 'activity.log')}", flush=True)
+    state["status"], state["pid"], state["stop"] = "RUNNING", os.getpid(), None
+    run.save()
+    try:
+        adopt(run)
+        advance(run)
+    except RunError as error:
+        finish(run, "NEEDS ATTENTION", error)
+        return 1
+    except KeyboardInterrupt:
+        finish(run, "INTERRUPTED", RunError("interrupted", hint="Inspect the worktree, then resume."))
+        return 130
+    except Exception as error:
+        finish(run, "CRASHED", RunError(f"{type(error).__name__}: {error}",
+                                        hint="A bug in agent-work; the traceback follows."))
+        raise
+    finish(run, READY)
+    return 0
+
+
+def detach(run):
+    console = run.folder / "console.log"
+    with console.open("ab") as stream:
+        child = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--execute", str(run.folder)],
+            stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    print(f"{run.state['task']} is running in the background, PID {child.pid}.")
+    print(f"  Watch:    tail -F {show(run.folder / 'activity.log')}")
+    print(f"  All runs: {command_name()} --list")
+    print(f"  Summary:  {show(run.folder / 'summary.md')}")
+    return 0
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def age(seconds):
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{int(seconds // size)}{unit}"
+    return f"{int(seconds)}s"
+
+
+def list_runs():
+    CACHE.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for folder in (path for path in CACHE.iterdir() if path.is_dir()):
+        if (folder / "state.json").is_file():
+            state = json.loads((folder / "state.json").read_text(encoding="utf-8"))
+            status = state["status"]
+            if status == "RUNNING" and not alive(state["pid"]):
+                status = "DIED"
+            reason = state["stop"]["reason"] if state["stop"] else ""
+        elif (folder / "summary.md").is_file():  # a run from before state.json; it cannot be resumed
+            text = (folder / "summary.md").read_text(encoding="utf-8")
+            status = re.search(r"^\*\*(.+)\*\*$", text, re.M)[1]
+            reason = ([""] + re.findall(r"^- Stopped: (.+)$", text, re.M))[-1]
+        else:
+            continue
+        log = folder / "activity.log"
+        rows.append(((log if log.exists() else folder).stat().st_mtime, status, folder.name, reason))
+    width = shutil.get_terminal_size((160, 24)).columns
+    print(f"{'STATUS':<22}{'IDLE':>6}  {'RUN':<42}WHY")
+    for when, status, name, reason in sorted(rows, reverse=True):
+        print(shorten(f"{status:<22}{age(time.time() - when):>6}  {name:<42}{reason}", width))
+    print(f"\nRun folders are in {show(CACHE)}; each has summary.md and activity.log.")
+
+
+def find_run(name):
+    folder = Path(name).expanduser()
+    folder = folder if folder.is_dir() else CACHE / name
+    if not (folder / "state.json").is_file():
+        raise RunError(f"no resumable run at {folder} (it needs a state.json)")
+    return folder.resolve()
+
+
+def start(args, parser):
+    if args.brief is None or not args.check:
+        parser.error("a new run needs a brief and at least one --check")
+    if args.name is not None and (not args.name.strip() or len(args.name.splitlines()) != 1
+                                  or args.name != args.name.strip()):
+        parser.error("--name must be one nonempty line without leading or trailing whitespace")
+    repairs = 2 if args.repairs is None else args.repairs
+    timeout = 30 if args.timeout is None else args.timeout
+    brief = read_brief(args.brief, args.package)
+    repo = Path(git(args.repo, "rev-parse", "--show-toplevel").strip())
+    base = git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.base}^{{commit}}").strip()
+    task = args.name or args.package or ("task" if args.brief == Path("-") else args.brief.stem)
+    reviewer = "codex" if args.builder == "opus" else "opus"
+    efforts = {
+        "opus": args.opus_effort or args.effort,
+        "codex": args.codex_effort or args.effort,
+        "agy": args.agy_effort,
+    }
+    check_needs(args.needs or [])
+    if args.dry_run:
+        print(f"{repo} @ {base}\n"
+              f"Task: {task}\n"
+              f"Builder: {args.builder} (effort: {efforts[args.builder]})\n"
+              f"Reviewer: {reviewer} (effort: {efforts[reviewer]})\n"
+              f"AGY advisory: {efforts['agy'] if args.agy else 'off'}\n"
+              f"Checks: {args.check!r}\nFinal checks: {args.final_check or []!r}\n"
+              f"Repair turns: {repairs}\nNeeds (available): {args.needs or []!r}\n\n{brief.rstrip()}")
+        return 0
+    for cli in ("claude", "codex", *(["agy"] if args.agy else [])):
+        if shutil.which(cli) is None:
+            raise RunError(f"{cli} is not on PATH")
+    slug = re.sub(r"[^a-z0-9]+", "-", task.lower()).strip("-")[:40] or "task"
+    CACHE.mkdir(parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix=f"{slug}-", dir=CACHE.resolve()))
+    worktree = folder / "worktree"
+    (folder / "brief.md").write_text(brief, encoding="utf-8")
+    state = {
+        "task": task,
+        "source": "stdin" if args.brief == Path("-") else str(args.brief.resolve()),
+        "repo": str(repo), "base": base, "branch": f"agent-work/{folder.name}", "worktree": str(worktree),
+        "builder": args.builder, "reviewer": reviewer, "efforts": efforts,
+        "agy": args.agy, "agy_pending": args.agy,
+        "checks": args.check, "final_checks": args.final_check or [],
+        "repairs": repairs, "timeout": timeout, "needs": args.needs or [],
+        "attempt": 0, "phase": "build", "commit": base,
+        "reply": "", "pending_reply": "", "review_feedback": "", "check_feedback": "", "last_report": "",
+        "resumes": 0, "status": "STARTING", "pid": None, "stop": None, "events": [],
+    }
+    (folder / "state.json").write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    activity(folder, f"Run started: {task}")
+    git(repo, "worktree", "add", "-b", state["branch"], str(worktree), base)
+    run = Run(folder)
+    return detach(run) if args.detach else execute(run)
+
+
+def resume(args, parser):
+    new_only = ["brief", "name", "package", "repo", "base", "builder", "agy", "effort",
+                "opus_effort", "codex_effort", "agy_effort", "dry_run"]
+    given = [name for name in new_only if getattr(args, name) != parser.get_default(name)]
+    if given:
+        parser.error(f"--resume keeps the run's settings; it takes only --check, --final-check, "
+                     f"--repairs, --timeout, --needs and --detach (got {', '.join(given)})")
+    run = Run(find_run(args.resume))
+    state = run.state
+    if state["status"] == "RUNNING" and alive(state["pid"]):
+        raise RunError(f"the run is still going (PID {state['pid']})")
+    for key, value in [("checks", args.check), ("final_checks", args.final_check),
+                       ("repairs", args.repairs), ("timeout", args.timeout), ("needs", args.needs)]:
+        if value is not None:
+            state[key] = value
+    check_needs(state["needs"])
+    state["resumes"] += 1
+    run.save()
+    activity(run.folder, f"Resumed ({state['resumes']})")
+    return detach(run) if args.detach else execute(run)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("brief", type=Path, nargs="?", help="Markdown task brief, package catalog, or - to read stdin")
+    parser.add_argument("--name", help="short task name for the worktree, commit messages, and summary")
+    parser.add_argument("--package", help="select an ID from a '### ID. Title' heading or table row")
+    parser.add_argument("--repo", type=Path, default=Path("."), help="target repository (default: current directory)")
+    parser.add_argument("--base", default="main", help="local Git ref to build on (default: main)")
+    parser.add_argument("--check", action="append", metavar="COMMAND",
+                        help="required shell check run by the runner (repeatable; with --resume, replaces the run's checks)")
+    parser.add_argument("--final-check", action="append", metavar="COMMAND",
+                        help="required shell check run after a clean review (repeatable; with --resume, replaces)")
+    parser.add_argument("--builder", choices=["opus", "codex"], default="opus",
+                        help="implementer; the other provider is the primary reviewer (default: opus)")
+    parser.add_argument("--agy", action="store_true", help="request an advisory review of the first reviewed candidate")
+    parser.add_argument("--effort", choices=LEVELS, default="xhigh",
+                        help="reasoning effort for both Opus and Codex (default: xhigh)")
+    parser.add_argument("--opus-effort", choices=(*LEVELS, "max"), help="override --effort for Opus")
+    parser.add_argument("--codex-effort", choices=LEVELS, help="override --effort for Codex")
+    parser.add_argument("--agy-effort", choices=(*LEVELS, "max"), default="medium",
+                        help="AGY reasoning effort when enabled (default: medium)")
+    parser.add_argument("--repairs", type=int,
+                        help="maximum repair turns after the first attempt (default: 2; with --resume, the new limit)")
+    parser.add_argument("--timeout", type=int, metavar="MINUTES", help="timeout per agent turn or check (default: 30)")
+    parser.add_argument("--needs", action="append", metavar="PATH|ssh:HOST",
+                        help="a drive, folder or SSH host the work needs; checked before the run starts "
+                             "and on each resume (repeatable; with --resume, replaces)")
+    parser.add_argument("--detach", action="store_true",
+                        help="run in the background; --list and activity.log show progress, a notification the end")
+    parser.add_argument("--resume", metavar="RUN", help="continue a stopped run, given its folder or folder name")
+    parser.add_argument("--list", action="store_true", help="show recent runs and their state")
+    parser.add_argument("--execute", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--dry-run", action="store_true", help="print the resolved brief and run settings")
+    args = parser.parse_args()
+    if args.repairs is not None and args.repairs < 0 or args.timeout is not None and args.timeout < 1:
+        parser.error("need a nonnegative repair count and a positive timeout")
+    if any(not command.strip() for command in (args.check or []) + (args.final_check or [])):
+        parser.error("checks must be nonempty")
+    signal.signal(signal.SIGTERM, interrupt)
+    if args.list:
+        list_runs()
+        return 0
+    if args.execute:
+        return execute(Run(args.execute))
+    try:
+        return resume(args, parser) if args.resume else start(args, parser)
+    except RunError as error:
+        print(f"agent-work: {error}", file=sys.stderr)
+        for line in error.details:
+            print(f"    {line}", file=sys.stderr)
+        if error.hint:
+            print(error.hint, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -93,3 +93,14 @@ export PATH="/Users/staniewi/.pixi/bin:$PATH"
 export PATH="$PATH:/Users/staniewi/.lmstudio/bin"
 # End of LM Studio CLI section
 
+# Prefer standalone tools after Homebrew, asdf, and other PATH setup.
+if [[ -d "$HOME/.local/bin" ]]; then
+    path=("$HOME/.local/bin" ${path:#$HOME/.local/bin})
+fi
+
+
+# Added by Antigravity CLI installer
+export PATH="/Users/staniewi/.local/bin:$PATH"
+
+test -e "${HOME}/.iterm2_shell_integration.zsh" && source "${HOME}/.iterm2_shell_integration.zsh"
+
